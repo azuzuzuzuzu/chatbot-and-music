@@ -1234,12 +1234,13 @@ async def _add_full_youtube_playlist(player: "GuildPlayer", url: str,
 
 class PlaylistChoiceView(discord.ui.View):
     """
-    View 2 nút hỏi: thêm cả playlist hay chỉ 1 bài. Chỉ người gọi bấm được.
+    View hỏi: thêm cả playlist, chỉ 1 bài, hay hủy. Chỉ người gọi bấm được.
 
-    Kết quả lưu vào self.choice: "all" | "single" | None (timeout).
+    Kết quả lưu vào self.choice: "all" | "single" | "cancel" | None (timeout).
+    Timeout (mặc định 60s) được tính là hủy -> yêu cầu bị hủy.
     """
 
-    def __init__(self, user_id: int, timeout: float = 30.0):
+    def __init__(self, user_id: int, timeout: float = 60.0):
         super().__init__(timeout=timeout)
         self.user_id = user_id
         self.choice: Optional[str] = None
@@ -1249,7 +1250,7 @@ class PlaylistChoiceView(discord.ui.View):
         """Chỉ cho đúng người gọi lệnh bấm nút."""
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
-                "❌ Đây không phải lựa chọn của bạn.", ephemeral=True)
+                "Đây không phải lựa chọn của bạn.", ephemeral=True)
             return False
         return True
 
@@ -1266,6 +1267,49 @@ class PlaylistChoiceView(discord.ui.View):
     async def add_single(self, interaction: discord.Interaction,
                          button: discord.ui.Button) -> None:
         self.choice = "single"
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Hủy",
+                       style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction,
+                     button: discord.ui.Button) -> None:
+        self.choice = "cancel"
+        await interaction.response.defer()
+        self.stop()
+
+
+class ConfirmView(discord.ui.View):
+    """
+    View xác nhận 2 nút: Xác nhận / Hủy. Chỉ người gọi bấm được.
+
+    Kết quả lưu vào self.confirmed: True | False | None (timeout).
+    """
+
+    def __init__(self, user_id: int, timeout: float = 30.0):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.confirmed: Optional[bool] = None
+
+    async def interaction_check(self,
+                               interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Đây không phải lựa chọn của bạn.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Xác nhận", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction,
+                      button: discord.ui.Button) -> None:
+        self.confirmed = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Hủy", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction,
+                     button: discord.ui.Button) -> None:
+        self.confirmed = False
         await interaction.response.defer()
         self.stop()
 
@@ -1521,21 +1565,21 @@ def music_act(guild_id: int, action: str, position: int, value: int) -> str:
 
 def music_skipto(guild_id: int, position: int) -> str:
     """
-    Bo qua den vi tri position, bo qua tat ca bai < position.
+    Bo qua den vi tri position trong hang doi (1-based, KHONG tinh bai dang phat).
 
-    Vi tri 1-based TINH CA BAI DANG PHAT (1 = bai dang phat, 2 = bai ke tiep...).
-    Vi du: skipto 69 -> bo qua bai dang phat + 67 bai dau hang doi, phat bai thu 69.
+    Quy uoc KHOP voi /queue va /remove: position 1 = bai dau tien trong hang
+    doi (bai tiep theo sau bai dang phat), position 2 = bai thu 2...
+    Vi du: skipto 9 -> phat bai thu 9 trong hang doi (hien thi o /queue la #9).
     (Lenh goi phai dam bao dang phat/pause roi moi goi voice.stop().)
     """
     player = _guild_players.get(guild_id)
     if player is None or player.voice is None or not player.voice.is_connected():
-        return "❌ Bot khong o trong kenh thoai nao."
+        return "Bot khong o trong kenh thoai nao."
     n = len(player.queue)
-    max_pos = n + 1  # tinh ca bai dang phat
-    if position < 1 or position > max_pos:
-        return f"❌ Vi tri khong hop le (1-{max_pos})."
+    if position < 1 or position > n:
+        return f"Vi tri khong hop le (1-{n})."
 
-    drop = max(0, position - 2)  # bo trong hang doi (khong tinh bai dang phat)
+    drop = position - 1  # bo (position-1) bai dau hang doi
     for _ in range(drop):
         player.queue.pop(0)
 
@@ -2343,22 +2387,33 @@ async def play(interaction: discord.Interaction, link: str):
     # Resolve + connect có thể lâu -> defer trước cho khỏi timeout.
     await interaction.response.defer()
 
-    # Nếu link có kèm playlist/album -> hỏi người gọi bằng 2 nút (chỉ họ thấy).
+    # Nếu link có kèm playlist/album -> hỏi người gọi bằng 3 nút (chỉ họ thấy).
     if _has_playlist(link):
         view = PlaylistChoiceView(interaction.user.id)
-        await interaction.followup.send(
-            "🎶 Link này có kèm playlist. Bạn muốn thêm gì?",
+        prompt_msg = await interaction.followup.send(
+            "Link này có kèm playlist. Bạn muốn thêm gì?",
             view=view, ephemeral=True,
         )
         await view.wait()
         if view.choice == "all":
             msg = await play_full_playlist(interaction.guild, interaction.user,
                                            interaction.channel, link)
-        else:
-            # "single" hoặc timeout (None) -> chỉ phát 1 bài.
+        elif view.choice == "single":
             msg = await play_single_from_link(interaction.guild,
                                               interaction.user,
                                               interaction.channel, link)
+        else:
+            # "cancel" hoặc timeout (None) -> hủy yêu cầu, gỡ nút.
+            try:
+                await prompt_msg.edit(content="Đã hủy.", view=None)
+            except discord.HTTPException:
+                pass
+            return
+        # Gỡ nút khỏi tin nhắn hỏi (chỉ trang trí, không ảnh hưởng kết quả).
+        try:
+            await prompt_msg.edit(view=None)
+        except discord.HTTPException:
+            pass
     else:
         msg = await music_play(interaction.guild, interaction.user,
                                interaction.channel, link)
@@ -2570,7 +2625,7 @@ async def act(interaction: discord.Interaction,
 
 @tree.command(
     name="skipto",
-    description="Bỏ qua đến bài thứ N (tính cả bài đang phát: 1 = đang phát).",
+    description="Bỏ qua đến bài thứ N trong hàng đợi (1 = bài đầu, khớp /queue).",
     guild=discord.Object(id=GUILD_ID),
 )
 @app_commands.describe(position="Vị trí (1 = bài đang phát, 2 = bài kế tiếp...)")
@@ -2593,11 +2648,31 @@ async def skipto(interaction: discord.Interaction, position: int):
             "Hiện không có gì đang phát.",
             allowed_mentions=SAFE_ALLOWED_MENTIONS)
         return
-    msg = music_skipto(interaction.guild.id, position)
-    # Gửi xác nhận TRƯỚC khi stop (stop kích hoạt _play_next báo "Đang phát").
+    # Validate range trước khi hỏi confirm (tránh confirm vị trí sai).
+    max_pos = len(player.queue)
+    if position < 1 or position > max_pos:
+        await interaction.response.send_message(
+            f"Vị trí không hợp lệ (1-{max_pos}).",
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return
+    # Hỏi xác nhận bằng 2 nút (chỉ người gọi bấm được).
+    view = ConfirmView(interaction.user.id)
     await interaction.response.send_message(
-        msg, ephemeral=_is_error_text(msg),
-        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        f"Xác nhận bỏ qua đến bài #{position}?", view=view, ephemeral=True)
+    await view.wait()
+    if view.confirmed is not True:
+        # Hủy hoặc timeout -> sửa tin nhắn xác nhận thành "Đã hủy." (giữ lại).
+        try:
+            await interaction.edit_original_response(
+                content="Đã hủy.", view=None,
+                allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        except discord.HTTPException:
+            pass
+        return
+    msg = music_skipto(interaction.guild.id, position)
+    # Gửi kết quả (đã gỡ nút) TRƯỚC khi stop (stop kích hoạt _play_next báo "Đang phát").
+    await interaction.edit_original_response(
+        content=msg, view=None, allowed_mentions=SAFE_ALLOWED_MENTIONS)
     if not _is_error_text(msg):
         player.touch()
         player.voice.stop()
@@ -3035,16 +3110,20 @@ def build_nowplaying_embed(player: "GuildPlayer") -> discord.Embed:
     """Dựng embed bài đang phát (title, người yêu cầu, tiến độ, âm lượng)."""
     t = player.current
     elapsed = (time.monotonic() - player.current_started) if player.current_started else 0.0
-    embed = discord.Embed(title="Đang phát")
+    embed = discord.Embed(
+        title="Đang phát",
+        color=discord.Color.blurple(),
+    )
     embed.add_field(name="Bài", value=f"**{_short_title(t.title, 200)}**",
                     inline=False)
     embed.add_field(name="Yêu cầu bởi", value=t.requester or "—", inline=True)
-    embed.add_field(name="Âm lượng", value=f"{int(player.volume * 100)}%",
+    embed.add_field(name="Âm lượng", value=f"{player.volume * 100:.1f}%",
                     inline=True)
     embed.add_field(name="Tiến độ", value=_progress_bar(elapsed, t.duration),
                     inline=False)
     if t.web_url:
         embed.add_field(name="Link", value=t.web_url, inline=False)
+    embed.set_footer(text="Nhạc cho server")
     return embed
 
 
@@ -3072,25 +3151,25 @@ async def play_saved_playlist(guild: discord.Guild, member: discord.Member,
 
 @tree.command(
     name="volume",
-    description="Chỉnh âm lượng phát nhạc (0-100).",
+    description="Chỉnh âm lượng phát nhạc (1.0-100.0, percent). 100.0 = gốc.",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(muc="Âm lượng từ 0 đến 100")
-async def volume_cmd(interaction: discord.Interaction, muc: int):
+@app_commands.describe(muc="Âm lượng từ 1.0 đến 100.0 (percent, 100.0 = gốc)")
+async def volume_cmd(interaction: discord.Interaction, muc: float):
     if is_feature_disabled(FEATURE_MUSIC):
         await interaction.response.send_message(
             feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
         return
     if not is_correct_guild(interaction.guild):
         await interaction.response.send_message(
-            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            "Lệnh này chỉ dùng được trong server được cấu hình.",
             ephemeral=True)
         return
     if not is_music_channel_allowed(interaction.channel.id):
         await interaction.response.send_message(_music_channel_hint(),
                                                 ephemeral=True)
         return
-    muc = max(0, min(100, muc))
+    muc = max(1.0, min(100.0, muc))
     vol = muc / 100.0
     player = get_player(interaction.guild.id)
     player.volume = vol
@@ -3102,7 +3181,7 @@ async def volume_cmd(interaction: discord.Interaction, muc: int):
             log.warning("voice.source không hỗ trợ chỉnh volume (không "
                         "phải PCMVolumeTransformer).")
     await interaction.response.send_message(
-        f"🔊 Âm lượng: **{muc}%**", allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        f"Âm lượng: **{muc:.1f}%**", allowed_mentions=SAFE_ALLOWED_MENTIONS)
 
 
 @tree.command(
@@ -3355,20 +3434,297 @@ async def on_ready():
 
 
 # --------------------------------------------------------------------------- #
+# Lệnh prefix nhóm owner / chatbot / tìm kiếm (dùng chung bởi handle_prefix)
+# --------------------------------------------------------------------------- #
+
+def _parse_channel_id(arg: str) -> Optional[int]:
+    """Lấy channel id từ mention <#id> hoặc số. Trả về int hoặc None."""
+    m = re.search(r"<#(\d+)>", arg or "")
+    if m:
+        return int(m.group(1))
+    for tok in (arg or "").split():
+        if tok.lstrip("-").isdigit():
+            return int(tok)
+    return None
+
+
+def _parse_bool(token: str) -> Optional[bool]:
+    """Chuyển token thành bool. Trả về None nếu không nhận diện được."""
+    t = (token or "").strip().lower()
+    if t in ("true", "on", "1", "yes", "bat", "bật"):
+        return True
+    if t in ("false", "off", "0", "no", "tat", "tắt"):
+        return False
+    return None
+
+
+async def _owner_reply(message: discord.Message, text: str) -> None:
+    """Gửi tin trả lời nhóm owner (tin lỗi tự xoá sau 5s)."""
+    if not text:
+        return
+    await message.channel.send(
+        text, reference=message,
+        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+        delete_after=5 if _is_error_text(text) else None,
+    )
+
+
+async def _handle_owner_prefix(message: discord.Message,
+                               cmd: str, arg: str) -> bool:
+    """Xử lý prefix owner: cdisable, cenable, csetkenh, csetkenhmusic."""
+    if not is_correct_guild(message.guild):
+        await _owner_reply(message, "Lệnh này chỉ dùng được trong server được cấu hình.")
+        return True
+    if not is_owner(message.author.id):
+        await _owner_reply(message, "Bạn không có quyền dùng lệnh này.")
+        return True
+
+    if cmd in ("disable", "enable"):
+        low = (arg or "").strip().lower()
+        # Xác định tính năng (bỏ khoảng trắng để so sánh linh hoạt).
+        norm = low.replace(" ", "")
+        if norm == "chatbot":
+            key = FEATURE_CHATBOT
+        elif norm in ("phátnhạc", "phatnhac", "music", "nhạc", "nhac"):
+            key = FEATURE_MUSIC
+        else:
+            key = None
+        if key is None:
+            await _owner_reply(message,
+                               "Dùng: `cdisable <chatbot | phát nhạc> [lý do]`")
+            return True
+        # Lý do = phần còn lại sau từ khóa tính năng.
+        if key == FEATURE_MUSIC:
+            reason = re.sub(r'^(phát nhạc|phat nhac|music|nhạc|nhac)\s*',
+                            '', low).strip()
+        else:
+            reason = re.sub(r'^chatbot\s*', '', low).strip()
+        label = FEATURE_LABELS.get(key, key)
+
+        if cmd == "disable":
+            if is_feature_disabled(key):
+                cur = get_feature_disable_reason(key)
+                extra = f" Lý do hiện tại: {cur}" if cur else ""
+                await _owner_reply(message,
+                                   f"Tính năng **{label}** đã tắt sẵn.{extra}")
+                return True
+            if not set_feature_disabled(key, True, reason=reason,
+                                        by=message.author.id):
+                await _owner_reply(message,
+                                   "Cập nhật thất bại khi ghi file. Thử lại sau.")
+                return True
+            if key == FEATURE_MUSIC:
+                try:
+                    await music_stop(GUILD_ID)
+                except Exception as e:  # noqa: BLE001
+                    log.error("Lỗi dừng nhạc khi disable music: %s", e)
+            msg = f"Đã tắt **{label}**." + (f" Lý do: {reason}" if reason else "")
+            await _owner_reply(message, msg)
+        else:
+            if not is_feature_disabled(key):
+                await _owner_reply(message,
+                                   f"Tính năng **{label}** đang bật sẵn.")
+                return True
+            if not set_feature_disabled(key, False):
+                await _owner_reply(message,
+                                   "Cập nhật thất bại khi ghi file. Thử lại sau.")
+                return True
+            await _owner_reply(message, f"Đã bật lại **{label}**.")
+        return True
+
+    # setkenh / setkenhmusic
+    ch_id = _parse_channel_id(arg)
+    if ch_id is None:
+        await _owner_reply(message,
+                           "Dùng: `csetkenh <#kênh hoặc id> <true/false>`")
+        return True
+    bool_tok = None
+    for tok in (arg or "").split():
+        if tok.lower() in ("true", "false", "on", "off", "1", "0",
+                           "bat", "bật", "tat", "tắt"):
+            bool_tok = tok.lower()
+            break
+    enable = _parse_bool(bool_tok)
+    if enable is None:
+        await _owner_reply(message,
+                           "Dùng: `csetkenh <#kênh> <true|false>`")
+        return True
+
+    if cmd == "setkenh":
+        allowed = load_allowed_channels()
+        changed = False
+        if enable:
+            if ch_id not in allowed:
+                allowed.append(ch_id)
+                changed = True
+                res = f"Đã thêm <#{ch_id}> vào danh sách cho phép."
+            else:
+                res = f"<#{ch_id}> đã có sẵn trong danh sách."
+        else:
+            if ch_id in allowed:
+                allowed.remove(ch_id)
+                changed = True
+                res = f"Đã gỡ <#{ch_id}> khỏi danh sách cho phép."
+            else:
+                res = f"<#{ch_id}> không có trong danh sách."
+        if changed and not save_allowed_channels(allowed):
+            await _owner_reply(message,
+                               "Cập nhật thất bại khi ghi file. Thử lại sau.")
+            return True
+        scope = ("Hiện danh sách trống → bot hoạt động ở mọi channel."
+                 if not allowed else
+                 "Bot chỉ hoạt động trong: "
+                 + ", ".join(f"<#{c}>" for c in allowed))
+        await _owner_reply(message, f"{res}\n{scope}")
+    else:  # setkenhmusic
+        allowed = load_music_channels()
+        changed = False
+        if enable:
+            if ch_id not in allowed:
+                allowed.append(ch_id)
+                changed = True
+                res = f"Đã thêm <#{ch_id}> vào kênh nhạc."
+            else:
+                res = f"<#{ch_id}> đã có sẵn trong danh sách."
+        else:
+            if ch_id in allowed:
+                allowed.remove(ch_id)
+                changed = True
+                res = f"Đã gỡ <#{ch_id}> khỏi kênh nhạc."
+            else:
+                res = f"<#{ch_id}> không có trong danh sách."
+        if changed and not save_music_channels(allowed):
+            await _owner_reply(message,
+                               "Cập nhật thất bại khi ghi file. Thử lại sau.")
+            return True
+        scope = ("Hiện danh sách trống → lệnh nhạc dùng được ở mọi kênh."
+                 if not allowed else
+                 "Lệnh nhạc chỉ dùng ở: "
+                 + ", ".join(f"<#{c}>" for c in allowed))
+        await _owner_reply(message, f"{res}\n{scope}")
+    return True
+
+
+async def _handle_chatbot_prefix(message: discord.Message, arg: str) -> bool:
+    """Xử lý prefix chatbot: cxoa (xóa lịch sử hội thoại)."""
+    if not is_correct_guild(message.guild):
+        await _owner_reply(message,
+                           "Lệnh này chỉ dùng được trong server được cấu hình.")
+        return True
+    if is_feature_disabled(FEATURE_CHATBOT):
+        await _owner_reply(message, feature_disabled_message(FEATURE_CHATBOT))
+        return True
+    user_id = message.author.id
+    path = _memory_path(user_id)
+    if not os.path.exists(path):
+        await _owner_reply(message, "Bạn chưa có lịch sử trò chuyện nào để xóa.")
+        return True
+    try:
+        os.remove(path)
+    except OSError as e:
+        log.error("Lỗi xóa memory user %s: %s", user_id, e)
+        await _owner_reply(message, "Xóa thất bại. Thử lại sau.")
+        return True
+    await _owner_reply(message, "Đã xóa lịch sử trò chuyện của bạn.")
+    return True
+
+
+async def _handle_search_prefix(message: discord.Message,
+                                cmd: str, arg: str) -> bool:
+    """Xử lý prefix tìm kiếm nhạc: cnhac, cnhacfile."""
+    if is_feature_disabled(FEATURE_MUSIC):
+        await _owner_reply(message, feature_disabled_message(FEATURE_MUSIC))
+        return True
+    if not is_correct_guild(message.guild):
+        await _owner_reply(message,
+                           "Lệnh này chỉ dùng được trong server được cấu hình.")
+        return True
+    if not is_music_channel_allowed(message.channel.id):
+        await _owner_reply(message, _music_channel_hint())
+        return True
+
+    if cmd == "nhac":
+        query = (arg or "").strip()
+        if not query:
+            await _owner_reply(message, "Dùng: `cnhac <từ khóa>`")
+            return True
+        async with message.channel.typing():
+            yt, sp = await asyncio.gather(
+                search_youtube(query), search_spotify_tracks(query))
+            results = merge_results(yt, sp)
+        if not results:
+            await _owner_reply(message,
+                               f"Không tìm thấy bài nào cho: **{query}**")
+            return True
+        view = MusicSearchView(message.author.id, results)
+        await message.channel.send(
+            embed=view._build_embed(), view=view, reference=message,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return True
+
+    # cnhacfile: cần đính kèm file audio.
+    if not AUDD_API_KEY:
+        await _owner_reply(message,
+                           "Chưa cấu hình AUDD_API_KEY. Không nhận diện được.")
+        return True
+    att = message.attachments[0] if message.attachments else None
+    if att is None:
+        await _owner_reply(message,
+                           "Dùng: `cnhacfile` kèm đính kèm file audio.")
+        return True
+    fname = os.path.basename(att.filename or "")
+    if not fname.lower().endswith(DIRECT_AUDIO_EXTS):
+        await _owner_reply(message,
+                           "Chỉ hỗ trợ file audio: "
+                           + ", ".join(DIRECT_AUDIO_EXTS))
+        return True
+    if att.size and att.size > 25 * 1024 * 1024:
+        await _owner_reply(message, "File quá lớn (tối đa 25MB).")
+        return True
+    async with message.channel.typing():
+        try:
+            data = await att.read()
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi đọc attachment: %s", e)
+            await _owner_reply(message, "Không đọc được file.")
+            return True
+        info = await recognize_audio(data, fname)
+    if not info or not info.get("title"):
+        await _owner_reply(message, "Không nhận diện được bài hát này.")
+        return True
+    embed = discord.Embed(
+        title="Nhận diện bài hát",
+        description=f"**{info['title']}**"
+                    + (f"\n{info['artist']}" if info["artist"] else ""),
+    )
+    if info.get("album"):
+        embed.add_field(name="Album", value=info["album"], inline=False)
+    if info.get("spotify_url"):
+        embed.add_field(name="Spotify", value=info["spotify_url"], inline=False)
+    res = {"source": "spotify", "url": "",
+           "title": info["title"], "artist": info["artist"]}
+    view = MusicAddView(message.author.id, res)
+    await message.channel.send(
+        embed=embed, view=view, reference=message,
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Sự kiện: nhận tin nhắn (luồng xử lý chatbot)
 # --------------------------------------------------------------------------- #
 
-async def handle_music_prefix(message: discord.Message) -> bool:
+async def handle_prefix(message: discord.Message) -> bool:
     """
-    Xử lý lệnh nhạc dạng prefix (cplay, cskip, cstop, cpause, cresume, cqueue).
+    Xử lý mọi lệnh dạng prefix (c + tên): nhạc, owner, chatbot, tìm kiếm.
 
-    Trả về True nếu tin nhắn là một lệnh nhạc (đã xử lý xong), False nếu không.
+    Trả về True nếu tin nhắn là một lệnh prefix (đã xử lý xong), False nếu không.
     """
     content = message.content.strip()
     if not content.lower().startswith(PREFIX):
         return False
 
-    # Tách lệnh và phần còn lại (link/từ khóa).
+    # Tách lệnh và phần còn lại (link/từ khóa/đối số).
     body = content[len(PREFIX):]
     parts = body.split(None, 1)
     if not parts:
@@ -3376,10 +3732,25 @@ async def handle_music_prefix(message: discord.Message) -> bool:
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
+    # --- Nhóm owner (không bị giới hạn kênh nhạc) ---
+    if cmd in ("disable", "enable", "setkenh", "setkenhmusic"):
+        return await _handle_owner_prefix(message, cmd, arg)
+
+    # --- Nhóm chatbot (chỉ xoa) ---
+    if cmd == "xoa":
+        return await _handle_chatbot_prefix(message, arg)
+
+    # --- Nhóm tìm kiếm nhạc (nhac, nhacfile) ---
+    if cmd in ("nhac", "nhacfile"):
+        return await _handle_search_prefix(message, cmd, arg)
+
+    # --- Nhóm nhạc (music) ---
     # Chỉ các cmd này mới là lệnh nhạc. Tin thường bắt đầu "c" (vd "chao")
     # không khớp -> trả False để luồng chatbot xử lý.
     MUSIC_CMDS = {"play", "skip", "stop", "pause", "resume", "unpause",
-                  "queue", "q", "remove", "rm", "act", "skipto"}
+                  "queue", "q", "remove", "rm", "act", "skipto",
+                  "volume", "nowplaying", "saveplaylist", "playplaylist",
+                  "mylists", "deletelist"}
     if cmd not in MUSIC_CMDS:
         return False
 
@@ -3414,27 +3785,33 @@ async def handle_music_prefix(message: discord.Message) -> bool:
             await reply("❌ Không xác định được người dùng.")
             return True
 
-        # Nếu link có kèm playlist -> hỏi bằng 2 nút (chỉ người gọi bấm được).
+        # Nếu link có kèm playlist -> hỏi bằng 3 nút (chỉ người gọi bấm được).
         # Prefix không có ephemeral -> gửi tin thường rồi xoá sau khi chọn/timeout.
         if _has_playlist(arg):
             view = PlaylistChoiceView(message.author.id)
             prompt = await channel.send(
-                "🎶 Link này có kèm playlist. Bạn muốn thêm gì?",
+                "Link này có kèm playlist. Bạn muốn thêm gì?",
                 reference=message, view=view,
                 allowed_mentions=SAFE_ALLOWED_MENTIONS,
             )
             await view.wait()
+            if view.choice == "all":
+                msg = await play_full_playlist(guild, message.author,
+                                               channel, arg)
+            elif view.choice == "single":
+                msg = await play_single_from_link(guild, message.author,
+                                                  channel, arg)
+            else:
+                # "cancel" hoặc timeout -> đổi prompt thành "Đã hủy." (giữ lại).
+                try:
+                    await prompt.edit(content="Đã hủy.", view=None)
+                except discord.HTTPException:
+                    pass
+                return True
             try:
                 await prompt.delete()
             except discord.HTTPException:
                 pass
-            async with channel.typing():
-                if view.choice == "all":
-                    msg = await play_full_playlist(guild, message.author,
-                                                   channel, arg)
-                else:
-                    msg = await play_single_from_link(guild, message.author,
-                                                      channel, arg)
             await reply(msg)
             return True
 
@@ -3497,6 +3874,108 @@ async def handle_music_prefix(message: discord.Message) -> bool:
         await reply(music_act(guild.id, parts[0], pos, val))
         return True
 
+    if cmd == "volume":
+        if not arg.strip():
+            await reply("Dùng: `cvolume <1.0-100.0>`")
+            return True
+        try:
+            val = float(arg.strip().replace(",", "."))
+        except ValueError:
+            await reply("Âm lượng phải là số (ví dụ 50.5).")
+            return True
+        val = max(1.0, min(100.0, val))
+        vol = val / 100.0
+        player = get_player(guild.id)
+        player.volume = vol
+        # Áp dụng ngay nếu đang phát (voice.source là PCMVolumeTransformer).
+        if player.voice is not None and player.voice.source is not None:
+            try:
+                player.voice.source.volume = vol
+            except AttributeError:
+                log.warning("voice.source không hỗ trợ chỉnh volume.")
+        await reply(f"Âm lượng: **{val:.1f}%**")
+        return True
+
+    if cmd == "nowplaying":
+        player = _guild_players.get(guild.id)
+        if player is None or player.current is None:
+            await reply("Hiện không có bài nào đang phát.")
+            return True
+        embed = build_nowplaying_embed(player)
+        await channel.send(
+            embed=embed, reference=message,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return True
+
+    if cmd == "saveplaylist":
+        if not arg:
+            await reply("Dùng: `csaveplaylist <tên>`")
+            return True
+        player = _guild_players.get(guild.id)
+        if player is None or (player.current is None and not player.queue):
+            await reply("Hàng đợi đang trống, không có gì để lưu.")
+            return True
+        queries: List[str] = []
+        if player.current is not None:
+            queries.append(player.current.query
+                           or player.current.web_url or player.current.title)
+        for tr in player.queue:
+            queries.append(tr.query or tr.web_url or tr.title)
+        queries = [q for q in queries if q]
+        name = arg.strip()
+        if not queries:
+            await reply("Không lấy được link bài nào để lưu.")
+            return True
+        if save_user_playlist(message.author.id, name, queries):
+            await reply(f"Đã lưu playlist **{name}** ({len(queries)} bài).")
+        else:
+            await reply("Lưu thất bại khi ghi file.")
+        return True
+
+    if cmd == "playplaylist":
+        if not arg:
+            await reply("Dùng: `cplayplaylist <tên>`")
+            return True
+        name = arg.strip()
+        queries = get_user_playlists(message.author.id).get(name)
+        if not queries:
+            await reply(f"Không tìm thấy playlist **{name}**. Dùng `cmylists`.")
+            return True
+        if not isinstance(message.author, discord.Member):
+            await reply("Không xác định được người dùng.")
+            return True
+        async with channel.typing():
+            msg = await play_saved_playlist(guild, message.author, channel,
+                                            name, queries)
+        if not msg:
+            await reply("Đã bắt đầu phát.")
+        else:
+            await reply(msg)
+        return True
+
+    if cmd == "mylists":
+        lists = get_user_playlists(message.author.id)
+        if not lists:
+            await reply("Bạn chưa lưu playlist nào. Dùng `csaveplaylist`.")
+            return True
+        lines = [f"**{n}** — {len(q)} bài" for n, q in lists.items()]
+        embed = discord.Embed(title="Playlist của bạn",
+                              description="\n".join(lines))
+        await channel.send(embed=embed, reference=message,
+                           allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return True
+
+    if cmd == "deletelist":
+        if not arg:
+            await reply("Dùng: `cdeletelist <tên>`")
+            return True
+        name = arg.strip()
+        if delete_user_playlist(message.author.id, name):
+            await reply(f"Đã xóa playlist **{name}**.")
+        else:
+            await reply(f"Không tìm thấy playlist **{name}**.")
+        return True
+
     if cmd == "skipto":
         if not arg.strip().lstrip("-").isdigit():
             await reply("Dùng: `cskipto <vị trí>`")
@@ -3506,11 +3985,31 @@ async def handle_music_prefix(message: discord.Message) -> bool:
             await reply("Hiện không có gì đang phát.")
             return True
         pos = int(arg.strip())
+        # Validate range trước confirm (tránh confirm vị trí sai).
+        max_pos = len(player.queue)
+        if pos < 1 or pos > max_pos:
+            await reply(f"Vị trí không hợp lệ (1-{max_pos}).")
+            return True
+        # Hỏi xác nhận bằng 2 nút (chỉ người gọi bấm được).
+        view = ConfirmView(message.author.id)
+        prompt = await channel.send(
+            f"Xác nhận bỏ qua đến bài #{pos}?", reference=message, view=view,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        await view.wait()
+        if view.confirmed is not True:
+            # Hủy hoặc timeout -> đổi prompt thành "Đã hủy." (giữ lại, không auto-xóa).
+            try:
+                await prompt.edit(content="Đã hủy.", view=None)
+            except discord.HTTPException:
+                pass
+            return True
+        try:
+            await prompt.delete()
+        except discord.HTTPException:
+            pass
         msg = music_skipto(guild.id, pos)
-        if _is_error_text(msg):
-            await reply(msg)
-        else:
-            await reply(msg)
+        await reply(msg)
+        if not _is_error_text(msg):
             player.touch()
             player.voice.stop()
         return True
@@ -3530,7 +4029,7 @@ async def on_message(message: discord.Message):
         return
 
     # 1b. Ưu tiên lệnh nhạc dạng prefix (cplay, cskip, ...). Nếu đã xử lý -> dừng.
-    if await handle_music_prefix(message):
+    if await handle_prefix(message):
         return
 
     # 1c. Nếu owner đã tắt chatbot -> bot im lặng (không phản hồi).

@@ -103,9 +103,16 @@ Mỗi lệnh có 2 cách dùng: lệnh slash (/) hoặc lệnh prefix (gõ "c" +
   Xem hàng đợi    /queue             cqueue  (hoặc cq)
   Xóa 1 bài Q      /remove <vị_trí>  cremove <vị_trí>
   Sắp xếp Q        /act <move|up|down> <vị_trí> <số>   cact <move|up|down> <vị_trí> <số>
-  Nhảy đến bài     /skipto <vị_trí>   cskipto <vị_trí>
-  Âm lượng        /volume <0-100>    (chỉ slash)
-  Đang phát       /nowplaying        (chỉ slash)
+  Nhảy đến bài     /skipto <vị_trí>   cskipto <vị_trí>   (có xác nhận)
+  Âm lượng        /volume <1.0-100.0> cvolume <1.0-100.0>
+  Đang phát       /nowplaying        cnowplaying
+
+Lệnh owner (chỉ OWNER_IDS): /disable=cdisable, /enable=cenable,
+/setkenh=csetkenh, /setkenhmusic=csetkenhmusic.
+Lệnh chatbot: /xoa=cxoa. Tìm kiếm: /nhac=cnhac, /nhacfile=cnhacfile
+(cnhacfile gõ kèm file đính kèm). Playlist cá nhân: /saveplaylist=csaveplaylist,
+/playplaylist=cplayplaylist, /mylists=cmylists, /deletelist=cdeletelist.
+Lưu ý: /promptsys và /rsprompt hiện CHỈ có dạng slash (chưa có prefix).
 
 Muốn phát nhạc: BẠN PHẢI ĐANG Ở TRONG MỘT KÊNH THOẠI trước đã.
 Bot sẽ vào đúng kênh thoại của bạn.
@@ -131,8 +138,10 @@ TỰ ĐỘNG RỜI KÊNH:
 
 
 ÂM LƯỢNG & NOW PLAYING:
-    /volume <0-100>     Chỉnh âm lượng (0 = tắt, 100 = gốc, >100 to hơn).
-                        Áp dụng ngay cả khi đang phát; lưu cho các bài sau.
+    /volume (hoặc cvolume) <1.0-100.0>
+                        Chỉnh âm lượng tổng (percent). 100.0 = gốc (1.0x),
+                        1.0 = nhỏ nhất. Áp dụng ngay cả khi đang phát; lưu
+                        cho các bài sau. Dạng prefix: cvolume <1.0-100.0>.
     /nowplaying         Xem bài đang phát: tên, người yêu cầu, thanh tiến độ,
                         âm lượng hiện tại. (Tiến độ tính từ lúc phát, không tính
                         thời gian tạm dừng.)
