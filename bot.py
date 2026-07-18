@@ -109,6 +109,15 @@ YTDL_OPTS = {
     "source_address": "0.0.0.0",
 }
 
+# Tùy chọn file cookie (session Google) để qua lỗi 403 của YouTube browse API
+# khi chạy trên IP datacenter/VPS bị chặn. Để trống nếu không cần.
+# Cách lấy: đăng nhập YouTube trên browser, xuất cookie (extension "Get
+# cookies.txt" hoặc `yt-dlp --cookies-from-browser chrome`) thành file .txt,
+# rồi đặt YTDL_COOKIE_FILE trỏ tới file đó (biến môi trường trong .env).
+YTDL_COOKIE_FILE = os.environ.get("YTDL_COOKIE_FILE", "")
+if YTDL_COOKIE_FILE and os.path.isfile(YTDL_COOKIE_FILE):
+    YTDL_OPTS["cookiefile"] = YTDL_COOKIE_FILE
+
 # Đường dẫn libopus tự đặt (ưu tiên cao nhất khi opus không tự load).
 # - Đặt qua biến môi trường OPUS_LIB, hoặc sửa trực tiếp ở đây.
 # - Ví dụ Windows: r\"C:\\opus\\opus.dll\"  (đặt file opus.dll vào đó).
@@ -1154,12 +1163,19 @@ async def resolve_spotify(url: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 def _youtube_has_playlist(url: str) -> bool:
-    """True nếu link YouTube có kèm playlist (tham số list=) nhưng KHÔNG phải
-    radio mix tự sinh (list bắt đầu bằng RD thường vô tận — vẫn cho hỏi)."""
+    """True nếu link YouTube có kèm playlist (tham số list=) và CÓ THỂ lấy được.
+
+    Loại trừ playlist radio/mix tự sinh (list bắt đầu bằng RD...) — YouTube báo
+    'unviewable', không lấy được danh sách -> chỉ phát 1 bài thay vì hỏi playlist.
+    """
     if "youtube.com" not in url and "youtu.be" not in url:
         return False
     m = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
-    return bool(m)
+    if not m:
+        return False
+    if m.group(1).startswith("RD"):  # Radio / Mix tự sinh -> unviewable
+        return False
+    return True
 
 
 def _is_spotify_collection(url: str) -> bool:
@@ -1184,6 +1200,19 @@ def _strip_youtube_playlist(url: str) -> str:
     return url
 
 
+def _normalize_youtube_playlist_url(url: str) -> str:
+    """Với link watch?v=...&list=PL..., trả về dạng playlist?list=PL...
+
+    yt-dlp ở chế độ extract_flat chỉ lấy ĐÚNG toàn bộ playlist khi truyền
+    URL playlist (playlist?list=...). Truyền watch URL có list= thì nó chỉ
+    trích xuất 1 video (bài đang mở), bỏ qua phần còn lại của playlist.
+    """
+    m = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
+    if m and "playlist?list=" not in url and "/playlist/" not in url:
+        return f"https://www.youtube.com/playlist?list={m.group(1)}"
+    return url
+
+
 async def _add_full_youtube_playlist(player: "GuildPlayer", url: str,
                                     requester: str) -> int:
     """Lấy toàn bộ playlist YouTube (giới hạn MAX_QUEUE_LEN) -> thêm vào queue.
@@ -1198,11 +1227,20 @@ async def _add_full_youtube_playlist(player: "GuildPlayer", url: str,
     opts["noplaylist"] = False
     opts["extract_flat"] = True       # Chỉ lấy id+title NHANH, không resolve stream.
     opts["playlistend"] = space
+    # Playlist listing dùng browse API hay bị YouTube chặn 403 với client web
+    # mặc định. Dùng client tv / web_safari để lấy được danh sách bài.
+    opts["extractor_args"] = {
+        "youtube": {"player_client": ["tv", "web_safari", "web"]}
+    }
+
+    # watch?v=...&list=PL... -> playlist?list=PL... (yt-dlp extract_flat chỉ
+    # lấy đúng toàn bộ playlist từ URL playlist, không từ watch URL).
+    extract_url = _normalize_youtube_playlist_url(url)
 
     def _extract() -> List[dict]:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(extract_url, download=False)
             if info and "entries" in info:
                 return [e for e in info["entries"] if e]
             return [info] if info else []
