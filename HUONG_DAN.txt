@@ -102,6 +102,8 @@ Mỗi lệnh có 2 cách dùng: lệnh slash (/) hoặc lệnh prefix (gõ "c" +
   Phát tiếp       /resume            cresume
   Xem hàng đợi    /queue             cqueue  (hoặc cq)
   Xóa 1 bài Q      /remove <vị_trí>  cremove <vị_trí>
+  Sắp xếp Q        /act <move|up|down> <vị_trí> <số>   cact <move|up|down> <vị_trí> <số>
+  Nhảy đến bài     /skipto <vị_trí>   cskipto <vị_trí>
   Âm lượng        /volume <0-100>    (chỉ slash)
   Đang phát       /nowplaying        (chỉ slash)
 
@@ -148,7 +150,7 @@ PLAYLIST CÁ NHÂN (lưu hàng đợi để phát lại sau):
 
 TÌM KIẾM NHẠC (YouTube + Spotify):
     Lệnh slash:
-        /nhac <từ_khóa>        Tìm bài trên YouTube VÀ Spotify, hiện danh sách
+        /nhac <từ_khóa>        Tìm bài trên YouTube VÀ Spotify (tối đa 10 kết quả gộp),
                                (embed) có phân trang (◀ Trước / Sau ▶). Chọn 1 bài
                                từ dropdown để thêm vào hàng đợi. Chỉ người gọi bấm
                                được. Bị chặn nếu owner đã /disable phát nhạc.

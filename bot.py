@@ -1472,6 +1472,82 @@ def music_remove(guild_id: int, index: int) -> str:
     return f"Đã xóa khỏi hàng đợi: **{track.title}**"
 
 
+def music_act(guild_id: int, action: str, position: int, value: int) -> str:
+    """
+    Sap xep lai hang doi: move / up / down.
+
+    Vi tri 1-based theo player.queue (KHONG tinh bai dang phat), khop /queue.
+      - move <pos> <target>: chuyen bai o vi tri pos den vi tri target.
+      - up   <pos> <n>:      chuyen bai len n vi tri (pos - n).
+      - down <pos> <n>:      chuyen bai xuong n vi tri (pos + n).
+    Vuot gioi han -> bao loi, khong thuc hien.
+    """
+    player = _guild_players.get(guild_id)
+    if player is None or not player.queue:
+        return "❌ Hang doi dang trong."
+    n = len(player.queue)
+    if action not in ("move", "up", "down"):
+        return "❌ Hanh dong khong hop le (chi move/up/down)."
+    if position < 1 or position > n:
+        return f"❌ Vi tri khong hop le (1-{n})."
+    if value <= 0:
+        return "❌ So buoc/vi tri dich phai lon hon 0."
+
+    if action == "up":
+        target = position - value
+        if target < 1:
+            return "❌ Vi tri vuot gioi han (len toi da den vi tri 1)."
+    elif action == "down":
+        target = position + value
+        if target > n:
+            return f"❌ Vi tri vuot gioi han (xuong toi da den vi tri {n})."
+    else:  # move
+        target = value
+        if target < 1 or target > n:
+            return f"❌ Vi tri dich khong hop le (1-{n})."
+
+    if target == position:
+        return f"Bai da o vi tri {position}."
+
+    track = player.queue.pop(position - 1)
+    insert_idx = target - 1
+    insert_idx = max(0, min(insert_idx, len(player.queue)))
+    player.queue.insert(insert_idx, track)
+    player.touch()
+
+    verb = {"move": "chuyen", "up": "dua len", "down": "dua xuong"}[action]
+    return f"Da {verb} bai #{position} -> #{insert_idx + 1}: **{track.title}**"
+
+
+def music_skipto(guild_id: int, position: int) -> str:
+    """
+    Bo qua den vi tri position, bo qua tat ca bai < position.
+
+    Vi tri 1-based TINH CA BAI DANG PHAT (1 = bai dang phat, 2 = bai ke tiep...).
+    Vi du: skipto 69 -> bo qua bai dang phat + 67 bai dau hang doi, phat bai thu 69.
+    (Lenh goi phai dam bao dang phat/pause roi moi goi voice.stop().)
+    """
+    player = _guild_players.get(guild_id)
+    if player is None or player.voice is None or not player.voice.is_connected():
+        return "❌ Bot khong o trong kenh thoai nao."
+    n = len(player.queue)
+    max_pos = n + 1  # tinh ca bai dang phat
+    if position < 1 or position > max_pos:
+        return f"❌ Vi tri khong hop le (1-{max_pos})."
+
+    drop = max(0, position - 2)  # bo trong hang doi (khong tinh bai dang phat)
+    for _ in range(drop):
+        player.queue.pop(0)
+
+    if player.queue:
+        target_title = player.queue[0].title
+        msg = f"Da bo qua den bai #{position}: **{target_title}**"
+    else:
+        msg = f"Da bo qua den bai #{position} (het hang doi)."
+    player.touch()
+    return msg
+
+
 async def music_stop(guild_id: int) -> str:
     """Dừng hẳn: xóa queue và rời kênh thoại."""
     player = _guild_players.get(guild_id)
@@ -2456,13 +2532,84 @@ async def remove_cmd(interaction: discord.Interaction, vi_tri: int):
     )
 
 
+@tree.command(
+    name="act",
+    description="Sắp xếp lại hàng đợi: chuyển/vượt lên/xuống (không tính bài đang phát).",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    action="move / up / down",
+    position="Vị trí bài (1 = bài kế tiếp, theo /queue)",
+    value="move: vị trí đích | up/down: số bước",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="move", value="move"),
+    app_commands.Choice(name="up", value="up"),
+    app_commands.Choice(name="down", value="down"),
+])
+async def act(interaction: discord.Interaction,
+              action: str, position: int, value: int):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.", ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    msg = music_act(interaction.guild.id, action, position, value)
+    await interaction.response.send_message(
+        msg, ephemeral=_is_error_text(msg),
+        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+    )
+
+
+@tree.command(
+    name="skipto",
+    description="Bỏ qua đến bài thứ N (tính cả bài đang phát: 1 = đang phát).",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(position="Vị trí (1 = bài đang phát, 2 = bài kế tiếp...)")
+async def skipto(interaction: discord.Interaction, position: int):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.", ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    player = _guild_players.get(interaction.guild.id)
+    if not _can_skip(player):
+        await interaction.response.send_message(
+            "Hiện không có gì đang phát.",
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return
+    msg = music_skipto(interaction.guild.id, position)
+    # Gửi xác nhận TRƯỚC khi stop (stop kích hoạt _play_next báo "Đang phát").
+    await interaction.response.send_message(
+        msg, ephemeral=_is_error_text(msg),
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+    if not _is_error_text(msg):
+        player.touch()
+        player.voice.stop()
+
+
 # --------------------------------------------------------------------------- #
 # Tìm kiếm nhạc: /nhac (YouTube + Spotify) và /nhacfile (nhận diện .mp3)
 # --------------------------------------------------------------------------- #
 
 SEARCH_YT_LIMIT = 10       # số kết quả YouTube mỗi lần tìm
 SEARCH_SP_LIMIT = 10       # số kết quả Spotify mỗi lần tìm
-SEARCH_TOTAL = 20          # tổng kết quả gộp hiển thị
+SEARCH_TOTAL = 10          # tổng kết quả gộp hiển thị (đã giảm từ 20)
 SEARCH_PAGE_SIZE = 5       # số bài mỗi trang embed
 
 
@@ -3232,7 +3379,7 @@ async def handle_music_prefix(message: discord.Message) -> bool:
     # Chỉ các cmd này mới là lệnh nhạc. Tin thường bắt đầu "c" (vd "chao")
     # không khớp -> trả False để luồng chatbot xử lý.
     MUSIC_CMDS = {"play", "skip", "stop", "pause", "resume", "unpause",
-                  "queue", "q", "remove", "rm"}
+                  "queue", "q", "remove", "rm", "act", "skipto"}
     if cmd not in MUSIC_CMDS:
         return False
 
@@ -3334,6 +3481,38 @@ async def handle_music_prefix(message: discord.Message) -> bool:
             await reply("❌ Dùng: `cremove <số thứ tự>`")
             return True
         await reply(music_remove(guild.id, int(arg.strip())))
+        return True
+
+    if cmd == "act":
+        parts = arg.split()
+        if len(parts) < 3 or parts[0] not in ("move", "up", "down"):
+            await reply("Dùng: `cact <move|up|down> <vị trí> <số>`")
+            return True
+        if not (parts[1].lstrip("-").isdigit()
+                and parts[2].lstrip("-").isdigit()):
+            await reply("Vị trí và số phải là số nguyên.")
+            return True
+        pos = int(parts[1])
+        val = int(parts[2])
+        await reply(music_act(guild.id, parts[0], pos, val))
+        return True
+
+    if cmd == "skipto":
+        if not arg.strip().lstrip("-").isdigit():
+            await reply("Dùng: `cskipto <vị trí>`")
+            return True
+        player = _guild_players.get(guild.id)
+        if not _can_skip(player):
+            await reply("Hiện không có gì đang phát.")
+            return True
+        pos = int(arg.strip())
+        msg = music_skipto(guild.id, pos)
+        if _is_error_text(msg):
+            await reply(msg)
+        else:
+            await reply(msg)
+            player.touch()
+            player.voice.stop()
         return True
 
     return False
