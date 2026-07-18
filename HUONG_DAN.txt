@@ -1,0 +1,218 @@
+============================================================
+  HƯỚNG DẪN SỬ DỤNG DISCORD CHATBOT + PHÁT NHẠC
+============================================================
+
+Bot chạy trong MỘT server (GUILD_ID cố định trong bot.py). Nó vừa là
+chatbot AI vừa phát nhạc qua kênh thoại.
+
+
+------------------------------------------------------------
+1. CÀI ĐẶT
+------------------------------------------------------------
+
+Bước 1 — Cài thư viện Python:
+    pip3 install -r requirements.txt
+
+Bước 2 — Cài ffmpeg (bắt buộc để phát nhạc):
+    - macOS:    brew install ffmpeg
+    - Windows:  winget install ffmpeg   (hoặc choco install ffmpeg)
+    - Linux:    sudo apt install ffmpeg
+
+Bước 3 — Đảm bảo libopus load được (bắt buộc để phát âm thanh):
+    - macOS:   thường đi kèm khi cài ffmpeg; nếu không: brew install opus
+    - Windows: tải opus.dll (bản x64), đặt vào 1 thư mục cố định, rồi
+               đặt biến môi trường OPUS_LIB trỏ tới file đó, ví dụ:
+                   set OPUS_LIB=C:\opus\opus.dll        (CMD)
+                   $env:OPUS_LIB="C:\opus\opus.dll"     (PowerShell)
+    - Khi chạy, nếu KHÔNG thấy log "Opus chưa load" là OK.
+
+
+------------------------------------------------------------
+2. CẤU HÌNH BIẾN MÔI TRƯỜNG
+------------------------------------------------------------
+
+Bắt buộc:
+    DISCORD_TOKEN       Token của bot (lấy từ Discord Developer Portal).
+
+Tùy chọn (chỉ cần nếu dùng link Spotify):
+    SPOTIFY_CLIENT_ID       Tạo app tại https://developer.spotify.com
+    SPOTIFY_CLIENT_SECRET   -> Dashboard -> Create app -> lấy Client ID/Secret
+
+Tùy chọn (chỉ cần nếu dùng /nhacfile nhận diện file audio):
+    AUDD_API_KEY            Đăng ký tại https://audd.io
+
+Không đặt Spotify thì link Spotify sẽ báo lỗi thân thiện, còn YouTube /
+SoundCloud / link file v.v. vẫn chạy bình thường.
+
+CÁCH ĐẶT BIẾN MÔI TRƯỜNG (KHUYÊN DÙNG):
+    - Tạo file ".env" từ ".env.example", điền giá trị thật vào.
+    - run.bat sẽ tự load ".env". File ".env" đã nằm trong .gitignore
+      nên KHÔNG bị commit lên git.
+    - TUYỆT ĐỐI không ghi token/key thật trực tiếp vào run.bat hay bot.py.
+    - Nếu token/key từng lộ: reset ngay trên portal tương ứng.
+
+
+------------------------------------------------------------
+3. BẬT INTENTS TRÊN DEVELOPER PORTAL
+------------------------------------------------------------
+
+Vào https://discord.com/developers -> chọn bot -> tab "Bot", bật:
+    - MESSAGE CONTENT INTENT   (để đọc nội dung tin nhắn cho chatbot + prefix)
+    - SERVER MEMBERS / VOICE   (để phát hiện kênh thoại trống — auto rời)
+
+
+------------------------------------------------------------
+4. CHẠY BOT
+------------------------------------------------------------
+
+    python3 bot.py
+
+Lần đầu chạy, bot sẽ tự đồng bộ (sync) các lệnh slash với server.
+Nếu lệnh slash chưa hiện, đợi vài phút hoặc khởi động lại Discord.
+
+
+------------------------------------------------------------
+5. CHATBOT AI
+------------------------------------------------------------
+
+Bot chỉ trả lời khi:
+    - Bạn @mention bot, HOẶC
+    - Bạn reply (trả lời) vào một tin nhắn của bot.
+
+Mỗi người có bộ nhớ hội thoại riêng và cooldown riêng.
+
+Lệnh slash cho chatbot:
+    /promptsys <nội dung>   Đặt personality (tính cách) riêng cho bạn.
+    /rsprompt               Đặt lại personality về mặc định.
+    /xoa                    Xóa toàn bộ lịch sử trò chuyện của bạn.
+
+
+------------------------------------------------------------
+6. PHÁT NHẠC
+------------------------------------------------------------
+
+Mỗi lệnh có 2 cách dùng: lệnh slash (/) hoặc lệnh prefix (gõ "c" + tên).
+
+  Chức năng        Lệnh slash        Lệnh prefix
+  -----------     --------------     -----------
+  Phát nhạc       /play <link>       cplay <link>
+  Bỏ qua bài      /skip              cskip
+  Dừng + rời      /stop              cstop
+  Tạm dừng        /pause             cpause
+  Phát tiếp       /resume            cresume
+  Xem hàng đợi    /queue             cqueue  (hoặc cq)
+  Xóa 1 bài Q      /remove <vị_trí>  cremove <vị_trí>
+  Âm lượng        /volume <0-100>    (chỉ slash)
+  Đang phát       /nowplaying        (chỉ slash)
+
+Muốn phát nhạc: BẠN PHẢI ĐANG Ở TRONG MỘT KÊNH THOẠI trước đã.
+Bot sẽ vào đúng kênh thoại của bạn.
+
+Nguồn nhạc hỗ trợ:
+    - Link YouTube, SoundCloud, Bandcamp, Vimeo... (yt-dlp)
+    - Link Spotify (track / album / playlist) — cần cấu hình Spotify
+    - Link file trực tiếp: .mp3 .m4a .ogg .opus .wav .flac .aac .webm
+    - Từ khóa tìm kiếm (ví dụ: cplay sơn tùng mtp)
+
+HÀNG ĐỢI (queue):
+    - Mỗi lần /play khi đang có bài phát -> bài mới vào cuối hàng đợi.
+    - Hết bài hiện tại, bot tự phát bài tiếp theo.
+
+LINK CÓ PLAYLIST (ví dụ YouTube ...&list=... hoặc playlist/album Spotify):
+    - Bot sẽ hỏi bằng 2 nút: "Thêm cả playlist" / "Chỉ bài này".
+    - Chỉ người gõ lệnh mới bấm được. Sau 30 giây không bấm -> chỉ phát 1 bài.
+
+TỰ ĐỘNG RỜI KÊNH:
+    - Bot tự rời kênh thoại (không báo) sau 5 phút nếu:
+        * Không phát nhạc, HOẶC
+        * Không còn ai (ngoài bot) trong kênh.
+
+
+ÂM LƯỢNG & NOW PLAYING:
+    /volume <0-100>     Chỉnh âm lượng (0 = tắt, 100 = gốc, >100 to hơn).
+                        Áp dụng ngay cả khi đang phát; lưu cho các bài sau.
+    /nowplaying         Xem bài đang phát: tên, người yêu cầu, thanh tiến độ,
+                        âm lượng hiện tại. (Tiến độ tính từ lúc phát, không tính
+                        thời gian tạm dừng.)
+
+
+PLAYLIST CÁ NHÂN (lưu hàng đợi để phát lại sau):
+    /saveplaylist <tên>     Lưu toàn bộ hàng đợi hiện tại (bài đang phát + queue)
+                            thành playlist mang tên bạn đặt.
+    /playplaylist <tên>     Thêm playlist đã lưu của bạn vào hàng đợi và phát.
+    /mylists                Liệt kê các playlist bạn đã lưu.
+    /deletelist <tên>       Xóa 1 playlist đã lưu.
+    - Playlist lưu riêng theo từng user (trong playlists.json).
+    - Khi phát lại, mỗi bài được resolve lại từ link/từ khóa đã lưu.
+
+
+TÌM KIẾM NHẠC (YouTube + Spotify):
+    Lệnh slash:
+        /nhac <từ_khóa>        Tìm bài trên YouTube VÀ Spotify, hiện danh sách
+                               (embed) có phân trang (◀ Trước / Sau ▶). Chọn 1 bài
+                               từ dropdown để thêm vào hàng đợi. Chỉ người gọi bấm
+                               được. Bị chặn nếu owner đã /disable phát nhạc.
+
+        /nhacfile <file>       Nhận diện bài hát từ 1 file audio (.mp3/...) qua
+                               API AudD, hiện kết quả (tên + ca sĩ + link Spotify)
+                               và nút "Thêm vào hàng đợi". Cần biến môi trường
+                               AUDD_API_KEY (đăng ký tại audd.io). Bị chặn nếu nhạc
+                               đã tắt. File tối đa 25MB.
+
+    - Kết quả YouTube phát trực tiếp; kết quả Spotify được tìm bản YouTube tương
+      ứng để phát (tái dùng logic /play).
+    - Spotify chỉ có kết quả nếu đã cấu hình SPOTIFY_CLIENT_ID / SECRET.
+
+
+------------------------------------------------------------
+7. LỆNH DÀNH CHO OWNER (người quản lý)
+------------------------------------------------------------
+
+Chỉ các user trong OWNER_IDS (cấu hình trong bot.py) dùng được:
+
+    /setkenh <kênh> <true/false>
+        Bật/tắt kênh cho phép CHATBOT hoạt động.
+        Danh sách trống = chatbot trả lời ở mọi kênh.
+
+    /setkenhmusic <kênh> <true/false>
+        Bật/tắt kênh cho phép dùng LỆNH NHẠC.
+        true  = thêm kênh vào danh sách cho phép.
+        false = gỡ kênh khỏi danh sách.
+        Có thể thêm nhiều kênh.
+        Danh sách trống = lệnh nhạc dùng được ở mọi kênh.
+        Khi đã có kênh trong danh sách: dùng lệnh nhạc ở kênh khác sẽ bị
+        chặn + báo ngắn (tự xoá sau 5s).
+
+    /disable <tính_năng> [lý_do]
+        Tắt hẳn một tính năng của bot (chỉ owner). Tính năng hợp lệ:
+            chatbot   - bot ngừng trả lời tin nhắn.
+            phát nhạc - mọi lệnh nhạc (slash + prefix) bị chặn, đang phát dừng.
+        [lý_do] không bắt buộc, lưu lại để hiện khi user thử dùng.
+        Trạng thái lưu trong disabled_features.json (tự sinh).
+
+    /enable <tính_năng>
+        Bật lại tính năng đã tắt ở trên.
+
+
+------------------------------------------------------------
+8. FILE DỮ LIỆU (tự sinh, không cần sửa tay)
+------------------------------------------------------------
+
+    memory/<user_id>.txt    Lịch sử trò chuyện từng người.
+    system_prompts.json     Personality riêng từng người (/promptsys).
+    allowed_channels.json   Danh sách kênh cho phép chatbot (/setkenh).
+    music_channels.json     Danh sách kênh cho phép lệnh nhạc (/setkenhmusic).
+    playlists.json          Playlist cá nhân người dùng (/saveplaylist...).
+    disabled_features.json  Trạng thái tắt/bật tính năng (/disable, /enable).
+    prompt.txt              Personality mặc định (sửa cần restart bot).
+
+
+------------------------------------------------------------
+9. LỖI THƯỜNG GẶP
+------------------------------------------------------------
+
+- "Opus chưa load"            -> xem lại Bước 3 (libopus / OPUS_LIB).
+- Bot vào kênh nhưng không phát tiếng -> thiếu ffmpeg hoặc opus.
+- Lệnh nhạc bị "chỉ dùng ở <kênh>" -> sang đúng kênh đã /setkenhmusic.
+- Link Spotify báo lỗi        -> chưa đặt SPOTIFY_CLIENT_ID / SECRET.
+- Prefix "c..." không ăn      -> kiểm tra MESSAGE CONTENT INTENT đã bật.

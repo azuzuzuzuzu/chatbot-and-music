@@ -1,0 +1,14 @@
+{
+  "chatbot": {
+    "disabled": true,
+    "reason": "rate_limited",
+    "by": 1004917748264087665,
+    "at": 1784375328.4213865
+  },
+  "music": {
+    "disabled": false,
+    "reason": "",
+    "by": null,
+    "at": null
+  }
+}
