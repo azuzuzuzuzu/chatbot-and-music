@@ -23,6 +23,7 @@ import random
 import hmac
 import hashlib
 import urllib.parse
+import html
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -1882,6 +1883,13 @@ async def play_full_playlist(guild: discord.Guild, member: discord.Member,
             await player.start_if_idle()
             if added == 1:
                 return ""  # _play_next đã gửi tin.
+        # Lưu ý playlist do Youtube tự tạo (radio/mix) - tự xóa sau 5s.
+        try:
+            await text_channel.send(
+                "Lưu ý: Bài hát trong playlist được thêm có thể bị thay đổi "
+                "do đây là playlist do Youtube tự tạo.", delete_after=5)
+        except discord.HTTPException:
+            pass
         return f"➕ Đã thêm {added} bài từ radio/mix vào hàng đợi."
 
     # YouTube playlist thường (PL/OL/UU/FL).
@@ -3146,6 +3154,10 @@ SEARCH_YT_LIMIT = 10       # số kết quả YouTube mỗi lần tìm
 SEARCH_SP_LIMIT = 10       # số kết quả Spotify mỗi lần tìm
 SEARCH_TOTAL = 10          # tổng kết quả gộp hiển thị (đã giảm từ 20)
 SEARCH_PAGE_SIZE = 5       # số bài mỗi trang embed
+LYRICS_PICK_TOTAL = 15     # tổng candidate khi tìm bài theo lyrics/tên
+LYRICS_PICK_PAGE = 5       # số candidate mỗi trang trong picker lyrics
+GENIUS_SEARCH_API = "https://genius.com/api/search/song"
+GENIUS_WEB = "https://genius.com"
 
 
 def _fmt_duration(seconds: Optional[float]) -> str:
@@ -3354,7 +3366,9 @@ class MusicSearchView(discord.ui.View):
         for idx, r in enumerate(slice_, start=start + 1):
             src = "YouTube" if r["source"] == "youtube" else "Spotify"
             dur = _fmt_duration(r.get("duration"))
-            meta = " · ".join(x for x in [r.get("artist"), dur, src] if x)
+            meta = " · ".join(x for x in [r.get("artist"), dur] if x)
+            if r.get("url"):
+                meta += f" · [{src}]({r['url']})"
             embed.add_field(
                 name=f"{idx}. {r.get('title', '?')}",
                 value=meta or "—",
@@ -3421,6 +3435,343 @@ class MusicAddView(discord.ui.View):
                 "❌ Đây không phải lựa chọn của bạn.", ephemeral=True)
             return False
         return True
+
+
+class LyricsSongSelect(discord.ui.Select):
+    """Dropdown chọn bài trong picker lyrics. Chọn xong hiện lyrics ngay."""
+
+    def __init__(self, options):
+        super().__init__(
+            placeholder="Chọn bài để xem lyrics...",
+            min_values=1, max_values=1, options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            idx = int(self.values[0])
+        except (ValueError, TypeError):
+            await interaction.followup.send("Lựa chọn không hợp lệ.",
+                                            ephemeral=True)
+            return
+        view = self.view
+        if not isinstance(view, LyricsPickView) or idx >= len(view.candidates):
+            await interaction.followup.send("Bài này không còn khả dụng.",
+                                            ephemeral=True)
+            return
+        await view.show_lyrics(interaction, idx)
+
+
+class LyricsPickView(discord.ui.View):
+    """Picker chọn bài (từ đoạn lyrics hoặc tên) rồi hiện lyrics."""
+
+    def __init__(self, user_id: int, candidates: "list", timeout: float = 180.0):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.candidates = candidates
+        self.page = 0
+        self.select = LyricsSongSelect(self._page_options())
+        self.show_btn = discord.ui.Button(
+            label="Hien lyrics", style=discord.ButtonStyle.primary)
+        self.show_btn.callback = self._on_show_btn
+        self.prev_btn = discord.ui.Button(
+            label="< Truoc", style=discord.ButtonStyle.secondary)
+        self.prev_btn.callback = self._on_prev
+        self.next_btn = discord.ui.Button(
+            label="Sau >", style=discord.ButtonStyle.secondary)
+        self.next_btn.callback = self._on_next
+        self.add_item(self.select)
+        self.add_item(self.show_btn)
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+        self._refresh()
+
+    def _page_count(self) -> int:
+        return max(1, (len(self.candidates) + LYRICS_PICK_PAGE - 1)
+                   // LYRICS_PICK_PAGE)
+
+    def _page_options(self) -> "list":
+        start = self.page * LYRICS_PICK_PAGE
+        opts = []
+        for idx, c in enumerate(
+                self.candidates[start:start + LYRICS_PICK_PAGE], start=start):
+            label = f"{idx + 1}. {(c.get('trackName') or '?')[:70]}"
+            if c.get("artistName"):
+                label += f" — {c['artistName'][:30]}"
+            opts.append(discord.SelectOption(label=label[:100], value=str(idx)))
+        return opts
+
+    def _build_embed(self) -> discord.Embed:
+        pages = self._page_count()
+        start = self.page * LYRICS_PICK_PAGE
+        slice_ = self.candidates[start:start + LYRICS_PICK_PAGE]
+        embed = discord.Embed(
+            title="Chon bai de xem lyrics",
+            description=(f"Chon bai tu danh sach (trang {self.page + 1}/"
+                         f"{pages}, tong {len(self.candidates)})."),
+            color=discord.Color.blurple(),
+        )
+        if not slice_:
+            embed.description = "Không có kết quả."
+        for i, c in enumerate(slice_, start=start + 1):
+            parts = []
+            if c.get("artistName"):
+                parts.append(c["artistName"])
+            if c.get("source") == "genius":
+                parts.append("Genius")
+            val = " · ".join(parts) or "—"
+            if c.get("web_url"):
+                val += f"\n[nghe lyrics]({c['web_url']})"
+            embed.add_field(
+                name=f"{i}. {c.get('trackName', '?')}",
+                value=val, inline=False,
+            )
+        embed.set_footer(text="Chi ban moi bam duoc cac nut nay.")
+        return embed
+
+    def _refresh(self) -> None:
+        pages = self._page_count()
+        self.select.options = self._page_options()
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= pages - 1
+
+    async def show_lyrics(self, interaction: discord.Interaction,
+                          idx: int) -> None:
+        """Lấy và gửi lyrics của candidate idx (công khai trong kênh)."""
+        cand = self.candidates[idx]
+        await interaction.followup.send(
+            f"Dang lay lyrics: **{cand.get('trackName', '?')}**...",
+            ephemeral=True)
+        lyrics = await fetch_lyrics_for_candidate(cand)
+        self.stop()
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        if not lyrics:
+            await interaction.followup.send(
+                f"Khong tim thay lyrics cho **{cand.get('trackName', '?')}**.",
+                ephemeral=True)
+            return
+        header = f"**{cand.get('trackName', '?')}**"
+        if cand.get("artistName"):
+            header += f" — {cand['artistName']}"
+        await interaction.channel.send(sanitize_mentions(header))
+        await send_long_message(interaction.channel, lyrics)
+
+    async def _on_show_btn(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self.select.values:
+            await interaction.followup.send("Hãy chọn 1 bài từ danh sách trước.",
+                                            ephemeral=True)
+            return
+        try:
+            idx = int(self.select.values[0])
+        except (ValueError, TypeError):
+            await interaction.followup.send("Lựa chọn không hợp lệ.",
+                                            ephemeral=True)
+            return
+        if idx >= len(self.candidates):
+            await interaction.followup.send("Bài này không còn khả dụng.",
+                                            ephemeral=True)
+            return
+        await self.show_lyrics(interaction, idx)
+
+    async def _on_prev(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+            self._refresh()
+        await interaction.response.edit_message(
+            embed=self._build_embed(), view=self)
+
+    async def _on_next(self, interaction: discord.Interaction) -> None:
+        if self.page < self._page_count() - 1:
+            self.page += 1
+            self._refresh()
+        await interaction.response.edit_message(
+            embed=self._build_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Đây không phải kết quả tìm kiếm của bạn.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except (discord.HTTPException, AttributeError):
+            pass
+
+
+class SongInfoSongSelect(discord.ui.Select):
+    """Dropdown chọn bài trong picker songinfo. Chọn xong hiện info ngay."""
+
+    def __init__(self, options):
+        super().__init__(
+            placeholder="Chọn bài để xem thông tin...",
+            min_values=1, max_values=1, options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            idx = int(self.values[0])
+        except (ValueError, TypeError):
+            await interaction.followup.send("Lựa chọn không hợp lệ.",
+                                            ephemeral=True)
+            return
+        view = self.view
+        if not isinstance(view, SongInfoPickView) or idx >= len(view.candidates):
+            await interaction.followup.send("Bài này không còn khả dụng.",
+                                            ephemeral=True)
+            return
+        await view.show_info(interaction, idx)
+
+
+class SongInfoPickView(discord.ui.View):
+    """Picker chọn bài (theo tên) rồi hiện thông tin bài hát."""
+
+    def __init__(self, user_id: int, guild_id: int, candidates: "list",
+                 timeout: float = 180.0):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.candidates = candidates
+        self.page = 0
+        self.select = SongInfoSongSelect(self._page_options())
+        self.show_btn = discord.ui.Button(
+            label="Xem info", style=discord.ButtonStyle.primary)
+        self.show_btn.callback = self._on_show_btn
+        self.prev_btn = discord.ui.Button(
+            label="< Truoc", style=discord.ButtonStyle.secondary)
+        self.prev_btn.callback = self._on_prev
+        self.next_btn = discord.ui.Button(
+            label="Sau >", style=discord.ButtonStyle.secondary)
+        self.next_btn.callback = self._on_next
+        self.add_item(self.select)
+        self.add_item(self.show_btn)
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+        self._refresh()
+
+    def _page_count(self) -> int:
+        return max(1, (len(self.candidates) + LYRICS_PICK_PAGE - 1)
+                   // LYRICS_PICK_PAGE)
+
+    def _page_options(self) -> "list":
+        start = self.page * LYRICS_PICK_PAGE
+        opts = []
+        for idx, c in enumerate(
+                self.candidates[start:start + LYRICS_PICK_PAGE], start=start):
+            label = f"{idx + 1}. {(c.get('trackName') or '?')[:70]}"
+            if c.get("artistName"):
+                label += f" — {c['artistName'][:30]}"
+            opts.append(discord.SelectOption(label=label[:100], value=str(idx)))
+        return opts
+
+    def _build_embed(self) -> discord.Embed:
+        pages = self._page_count()
+        start = self.page * LYRICS_PICK_PAGE
+        slice_ = self.candidates[start:start + LYRICS_PICK_PAGE]
+        embed = discord.Embed(
+            title="Chon bai de xem thong tin",
+            description=(f"Chon bai tu danh sach (trang {self.page + 1}/"
+                         f"{pages}, tong {len(self.candidates)})."),
+            color=discord.Color.blurple(),
+        )
+        if not slice_:
+            embed.description = "Không có kết quả."
+        for i, c in enumerate(slice_, start=start + 1):
+            parts = []
+            if c.get("artistName"):
+                parts.append(c["artistName"])
+            if c.get("source"):
+                parts.append(str(c["source"]))
+            val = " · ".join(parts) or "—"
+            if c.get("web_url"):
+                val += f"\n[nguon]({c['web_url']})"
+            embed.add_field(
+                name=f"{i}. {c.get('trackName', '?')}",
+                value=val, inline=False,
+            )
+        embed.set_footer(text="Chi ban moi bam duoc cac nut nay.")
+        return embed
+
+    def _refresh(self) -> None:
+        pages = self._page_count()
+        self.select.options = self._page_options()
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= pages - 1
+
+    async def show_info(self, interaction: discord.Interaction, idx: int) -> None:
+        """Lấy và gửi embed thông tin của candidate idx (công khai trong kênh)."""
+        cand = self.candidates[idx]
+        await interaction.followup.send(
+            f"Dang lay thong tin: **{cand.get('trackName', '?')}**...",
+            ephemeral=True)
+        player = _guild_players.get(self.guild_id)
+        embed = await _build_candidate_info_embed(player, cand)
+        self.stop()
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        try:
+            await interaction.channel.send(
+                embed=embed, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        except discord.HTTPException:
+            pass
+
+    async def _on_show_btn(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self.select.values:
+            await interaction.followup.send("Hãy chọn 1 bài từ danh sách trước.",
+                                            ephemeral=True)
+            return
+        try:
+            idx = int(self.select.values[0])
+        except (ValueError, TypeError):
+            await interaction.followup.send("Lựa chọn không hợp lệ.",
+                                            ephemeral=True)
+            return
+        if idx >= len(self.candidates):
+            await interaction.followup.send("Bài này không còn khả dụng.",
+                                            ephemeral=True)
+            return
+        await self.show_info(interaction, idx)
+
+    async def _on_prev(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+            self._refresh()
+        await interaction.response.edit_message(
+            embed=self._build_embed(), view=self)
+
+    async def _on_next(self, interaction: discord.Interaction) -> None:
+        if self.page < self._page_count() - 1:
+            self.page += 1
+            self._refresh()
+        await interaction.response.edit_message(
+            embed=self._build_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Đây không phải kết quả tìm kiếm của bạn.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except (discord.HTTPException, AttributeError):
+            pass
 
 
 @tree.command(
@@ -3769,23 +4120,39 @@ async def lyrics_cmd(interaction: discord.Interaction, ten_bai: str = ""):
                 ephemeral=True)
             return
         name = player.current.title
-    await interaction.response.defer()
-    lyrics = await get_lyrics(name)
-    if not lyrics:
-        await interaction.followup.send(
-            f"Không tìm thấy lời cho '{name}'.", ephemeral=True)
+        await interaction.response.defer()
+        lyrics = await get_lyrics(name)
+        if not lyrics:
+            await interaction.followup.send(
+                f"Không tìm thấy lời cho '{name}'.", ephemeral=True)
+            return
+        await interaction.followup.send(f"**{name}**")
+        await send_long_message(interaction.channel, lyrics)
         return
-    # Gửi header rồi chia lời bài hát thành các phần (giới hạn Discord).
-    await interaction.followup.send(f"**{name}**")
-    await send_long_message(interaction.channel, lyrics)
+    # Theo tên: tìm candidate, nếu nhiều bài thì cho user chọn.
+    await interaction.response.defer()
+    cands = await search_song_candidates(name)
+    if len(cands) <= 1:
+        lyrics = await get_lyrics(name)
+        if not lyrics:
+            await interaction.followup.send(
+                f"Không tìm thấy lời cho '{name}'.", ephemeral=True)
+            return
+        await interaction.followup.send(f"**{name}**")
+        await send_long_message(interaction.channel, lyrics)
+        return
+    view = LyricsPickView(interaction.user.id, cands)
+    await interaction.followup.send(
+        embed=view._build_embed(), view=view,
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
 
 
 @tree.command(
     name="songinfo",
-    description="Thông tin bài hát đang phát, hoặc tra theo tên bài.",
+    description="Thông tin bài hát đang phát, hoặc tra theo tên bài / vị trí queue.",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(ten_bai="Tên bài (bỏ trống = bài đang phát)")
+@app_commands.describe(ten_bai="Tên bài hoặc vị trí queue (vd c1,c2). Cách nhau bởi dấu phẩy. Nhiều bài khớp tên -> chọn từ danh sách. Bỏ trống = bài đang phát.")
 async def songinfo_cmd(interaction: discord.Interaction, ten_bai: str = ""):
     if is_feature_disabled(FEATURE_MUSIC):
         await interaction.response.send_message(
@@ -3801,12 +4168,17 @@ async def songinfo_cmd(interaction: discord.Interaction, ten_bai: str = ""):
                                                 ephemeral=True)
         return
     await interaction.response.defer()
-    embed, err = await get_songinfo(interaction.guild.id, ten_bai or "")
-    if err:
+    res = await run_songinfo(interaction.guild.id, ten_bai or "")
+    for err in res["errors"]:
         await interaction.followup.send(err, ephemeral=True)
-        return
-    await interaction.followup.send(embed=embed,
-                                    allowed_mentions=SAFE_ALLOWED_MENTIONS)
+    for embed in res["embeds"]:
+        await interaction.followup.send(embed=embed,
+                                        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+    if res["pick"]:
+        view = SongInfoPickView(interaction.user.id, interaction.guild.id,
+                                res["pick"])
+        await interaction.followup.send(embed=view._build_embed(), view=view,
+                                        allowed_mentions=SAFE_ALLOWED_MENTIONS)
 
 
 @tree.command(
@@ -3834,26 +4206,27 @@ async def nhaclyrics_cmd(interaction: discord.Interaction, doan_lyrics: str):
             "❌ Dùng: `/nhaclyrics <đoạn lyrics>`", ephemeral=True)
         return
     await interaction.response.defer()
-    results = await search_songs_by_lyrics_multi(doan_lyrics.strip())
-    if not results:
+    cands = await search_song_candidates(doan_lyrics.strip())
+    if not cands:
         await interaction.followup.send(
             "Không tìm thấy bài nào khớp đoạn lyrics đó.", ephemeral=True)
         return
-    lines = []
-    for i, r in enumerate(results, start=1):
-        title = r.get("trackName") or "?"
-        artist = r.get("artistName") or ""
-        album = r.get("albumName") or ""
-        meta = " · ".join(p for p in (artist, album) if p)
-        lines.append(f"{i}. **{title}**" + (f" — {meta}" if meta else ""))
-    embed = discord.Embed(
-        title="Tìm bài theo lời",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text=f"{len(results)} kết quả · nguồn lrclib.net")
-    await interaction.followup.send(embed=embed,
-                                    allowed_mentions=SAFE_ALLOWED_MENTIONS)
+    if len(cands) == 1:
+        cand = cands[0]
+        lyrics = await fetch_lyrics_for_candidate(cand)
+        if not lyrics:
+            await interaction.followup.send(
+                f"Không tìm thấy lời cho '{cand['trackName']}'.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"**{cand['trackName']}**"
+            + (f" — {cand['artistName']}" if cand['artistName'] else ""))
+        await send_long_message(interaction.channel, lyrics)
+        return
+    view = LyricsPickView(interaction.user.id, cands)
+    await interaction.followup.send(
+        embed=view._build_embed(), view=view,
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
 
 
 @tree.command(
@@ -4478,7 +4851,7 @@ async def _mxm_call(method: str, params: dict,
     sig = hmac.new(_MXM_SECRET.encode(), qs.encode(), hashlib.sha1).hexdigest()
     url = f"{_MXM_BASE}{method}?{qs}&signature={sig}&signature_protocol=sha1a"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        return await resp.json()
+        return await resp.json(content_type=None)
 
 
 async def fetch_lyrics_audd(track_name: str) -> Optional[str]:
@@ -4638,6 +5011,352 @@ async def search_songs_by_lyrics_multi(query: str) -> "list":
     return results[:SEARCH_TOTAL]
 
 
+# --------------------------------------------------------------------------- #
+# Genius (tìm bài + scrape lyrics). Không dùng thư viện ngoài, tự gọi HTTP.
+# Genius mạnh nhất để tìm bài theo đoạn lyrics, nhưng dễ 403 / rate-limit và
+# vi phạm ToS khi scrape. Dùng làm bổ sung khi lrclib + Musixmatch không đủ,
+# luôn bọc try/except để không làm sập bot.
+# --------------------------------------------------------------------------- #
+
+_LYRICS_DIV_RE = re.compile(
+    r'data-lyrics-container="true"[^>]*>(.*?)</div>', re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+# Các tên ngôn ngữ Genius hay chèn riêng dòng cạnh "Translations".
+_GENIUS_LANGS = frozenset({
+    "english", "vietnamese", "korean", "spanish", "french", "japanese",
+    "chinese", "german", "portuguese", "russian", "italian", "thai",
+    "indonesian", "romanian", "turkish", "polish", "arabic", "hindi",
+    "malay", "filipino", "dutch",
+})
+
+
+def _clean_genius_lyrics(text: str) -> str:
+    """Làm sạch lyrics scrape từ Genius:
+    - bỏ phần dẫn đầu (header: '15 Contributors', 'Translations', tên bài);
+    - đưa nhãn [Section] lên dòng riêng, ngăn cách dòng trống;
+    - bỏ dòng rác (Contributors/Translations/tên ngôn ngữ)."""
+    if not text:
+        return ""
+    # Bỏ preamble đến nhãn [ đầu tiên (chứa header Genius).
+    first = re.search(r"\[", text)
+    if first:
+        text = text[first.start():]
+    # Mỗi nhãn [x] -> dòng riêng, có dòng trống trước và sau.
+    text = re.sub(
+        r"\[([^\]\n]{1,60})\]",
+        lambda m: "\n\n[" + m.group(1).strip() + "]\n", text)
+    out: "list" = []
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if not s:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if re.search(r"\bContributors\b", s) or re.search(r"\bTranslations\b", s):
+            continue
+        if s.lower() in _GENIUS_LANGS:
+            continue
+        out.append(s)
+    # Gọt dòng trống thừa ở đầu/cuối và gộp liền kề.
+    while out and out[0] == "":
+        out.pop(0)
+    while out and out[-1] == "":
+        out.pop()
+    merged: "list" = []
+    for ln in out:
+        if ln == "" and merged and merged[-1] == "":
+            continue
+        merged.append(ln)
+    return "\n".join(merged)
+
+
+def _genius_search_url(name: str, artist: str) -> str:
+    q = f"{name} {artist}".strip()
+    return f"{GENIUS_WEB}/search?q={urllib.parse.quote(q)}"
+
+
+async def search_genius_songs(query: str,
+                              limit: int = LYRICS_PICK_TOTAL) -> "list":
+    """Tìm bài trên Genius bằng đoạn text. Trả list chuẩn hóa
+    {trackName, artistName, web_url, source='genius'}."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                GENIUS_SEARCH_API, params={"q": query}, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi Genius search %r: %s", query, e)
+        return []
+    out: "list" = []
+    sections = (data.get("response") or {}).get("sections") or []
+    for sec in sections:
+        for hit in (sec.get("hits") or []):
+            res = hit.get("result") or {}
+            title = res.get("title") or ""
+            if not title:
+                continue
+            artist = (res.get("primary_artist") or {}).get("name") or ""
+            out.append({
+                "trackName": title,
+                "artistName": artist,
+                "web_url": res.get("url") or "",
+                "source": "genius",
+            })
+            if len(out) >= limit:
+                return out
+    return out
+
+
+async def fetch_lyrics_genius(url: str) -> Optional[str]:
+    """Scrape lyrics từ trang bài hát Genius. Trả None nếu fail."""
+    if not url:
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                raw = await resp.text()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi Genius scrape %r: %s", url, e)
+        return None
+    blocks = _LYRICS_DIV_RE.findall(raw)
+    if not blocks:
+        return None
+    parts = []
+    for b in blocks:
+        txt = _BR_RE.sub("\n", b)      # <br> -> xuống dòng giữ nguyên các dòng
+        txt = _TAG_RE.sub("", txt)
+        txt = html.unescape(txt)
+        parts.append(txt)
+    lyrics = "\n".join(p.strip() for p in parts if p.strip())
+    lyrics = re.sub(r"\n{3,}", "\n\n", lyrics).strip()
+    lyrics = _clean_genius_lyrics(lyrics)
+    return lyrics or None
+
+
+DDG_HTML = "https://html.duckduckgo.com/html/"
+_DDG_RESULT_RE = re.compile(
+    r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
+_DDG_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _ddg_real_url(href: str) -> str:
+    m = re.search(r"uddg=([^&]+)", href)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    return href
+
+
+def _clean_ddg_title(text: str) -> str:
+    text = _DDG_TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s*[\|\-–]\s*(lyrics?|genius|azlyrics|musixmatch).*$",
+                  "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+async def search_songs_ddg(query: str,
+                           limit: int = LYRICS_PICK_TOTAL) -> "list":
+    """Tìm bài từ đoạn lyrics qua DuckDuckGo HTML (scrape tiêu đề kết quả).
+    Trả list {trackName, artistName, web_url, source}."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                DDG_HTML, data={"q": f"lyrics {query}"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return []
+                raw = await resp.text()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi DDG search %r: %s", query, e)
+        return []
+    out = []
+    for href, inner in _DDG_RESULT_RE.findall(raw):
+        url = _ddg_real_url(href)
+        title = _clean_ddg_title(inner)
+        if not title:
+            continue
+        if " - " in title:
+            name, artist = title.split(" - ", 1)
+        else:
+            name, artist = title, ""
+        src = "genius" if "genius.com" in url else "ddg"
+        out.append({
+            "trackName": name.strip(),
+            "artistName": artist.strip(),
+            "web_url": url,
+            "source": src,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _cand_key(name: str, artist: str) -> str:
+    s = f"{(name or '').lower()} :: {(artist or '').lower()}"
+    return re.sub(r"\s+", " ", s).strip()
+
+
+async def search_nhaccuatui(query: str,
+                             limit: int = LYRICS_PICK_TOTAL) -> "list":
+    """Tìm bài hát trên NhacCuaTui (Việt Nam) theo từ khóa. Best-effort:
+    scrape trang tim-kiem; nếu bị chặn/JS-render -> trả []. Bọc try/except."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    url = ("https://www.nhaccuatui.com/tim-kiem/bai-hat?q="
+           + urllib.parse.quote(query) + "&b=keyword&l=tat-ca&s=default")
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Referer": "https://www.nhaccuatui.com/",
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return []
+                html = await resp.text()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi NhacCuaTui %r: %s", query, e)
+        return []
+    out: "list" = []
+    seen = set()
+    parts = re.split(r'<div[^>]*id="sn_search_single_song"', html)
+    for part in parts[1:]:
+        tm = re.search(
+            r'class="title-item"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            part, re.DOTALL)
+        if not tm:
+            continue
+        link = tm.group(1)
+        title = re.sub(r"<[^>]+>", "", tm.group(2)).strip()
+        am = re.search(r'class="artist-item"[^>]*>\s*<a[^>]*>(.*?)</a>',
+                       part, re.DOTALL)
+        artist = re.sub(r"<[^>]+>", "", am.group(1)).strip() if am else ""
+        if not title:
+            continue
+        key = _cand_key(title, artist)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "trackName": title,
+            "artistName": artist,
+            "web_url": link,
+            "source": "nhaccuatui",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def search_song_candidates(query: str) -> "list":
+    """Tìm candidate bài hát từ đoạn lyrics/tên.
+
+    Nguồn chính: lrclib + Musixmatch (search_songs_by_lyrics_multi).
+    Bổ sung Genius khi kết quả < 5 (Genius mạnh cho lyric-text search).
+    Trả list {trackName, artistName, web_url, source}, đã dedupe,
+    tối đa LYRICS_PICK_TOTAL.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    base = await search_songs_by_lyrics_multi(query)
+    out: "list" = []
+    seen = set()
+    for r in base:
+        name = r.get("trackName") or ""
+        if not name:
+            continue
+        artist = r.get("artistName") or ""
+        key = _cand_key(name, artist)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "trackName": name,
+            "artistName": artist,
+            "web_url": r.get("web_url") or _genius_search_url(name, artist),
+            "source": r.get("source") or "lrclib",
+        })
+    if len(out) < LYRICS_PICK_TOTAL:
+        try:
+            extra = await search_genius_songs(query)
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi Genius bổ sung: %s", e)
+            extra = []
+        for r in extra:
+            key = _cand_key(r["trackName"], r["artistName"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+            if len(out) >= 5:
+                break
+    if len(out) < 5:
+        try:
+            extra = await search_songs_ddg(query)
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi DDG bổ sung: %s", e)
+            extra = []
+        for r in extra:
+            key = _cand_key(r["trackName"], r["artistName"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+            if len(out) >= LYRICS_PICK_TOTAL:
+                break
+    if len(out) < 5:
+        try:
+            extra = await search_nhaccuatui(query)
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi NhacCuaTui bổ sung: %s", e)
+            extra = []
+        for r in extra:
+            key = _cand_key(r["trackName"], r["artistName"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+            if len(out) >= LYRICS_PICK_TOTAL:
+                break
+    return out[:LYRICS_PICK_TOTAL]
+
+
+async def fetch_lyrics_for_candidate(cand: dict) -> Optional[str]:
+    """Lấy lyrics cho candidate đã chọn. Genius -> scrape url;
+    khác -> get_lyrics(tên - artist)."""
+    name = cand.get("trackName") or ""
+    artist = cand.get("artistName") or ""
+    if cand.get("source") == "genius" and cand.get("web_url"):
+        ly = await fetch_lyrics_genius(cand["web_url"])
+        if ly:
+            return ly
+    q = f"{name} - {artist}".strip() if artist else name
+    return await get_lyrics(q)
+
+
 def _queue_position(player, query: str) -> Optional[str]:
     """Tìm vị trí bài khớp query trong current + queue. Trả chuỗi hoặc None."""
     q = (query or "").lower()
@@ -4652,55 +5371,11 @@ def _queue_position(player, query: str) -> Optional[str]:
     return None
 
 
-async def get_songinfo(guild_id: int, query: Optional[str] = None):
-    """Trả về (embed, None) khi thành công, hoặc (None, error_text).
-
-    - Có query: tra lrclib theo tên bài -> thông tin cơ bản + vị trí queue.
-    - Không query: lấy thông tin bài đang phát (full: nguồn + chất lượng).
-    """
-    query = (query or "").strip()
-    player = _guild_players.get(guild_id)
-
-    if query:
-        info = await fetch_track_info(query)
-        if not info:
-            return None, f"Không tìm thấy thông tin cho '{query}'."
-        embed = discord.Embed(
-            title="Thông tin bài hát",
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(
-            name="Bài",
-            value=f"**{_short_title(info.get('trackName') or query, 200)}**",
-            inline=False)
-        if info.get("artistName"):
-            embed.add_field(name="Nghệ sĩ", value=info["artistName"], inline=True)
-        if info.get("albumName"):
-            embed.add_field(name="Album", value=info["albumName"], inline=True)
-        dur = _fmt_duration(info.get("duration"))
-        if dur:
-            embed.add_field(name="Thời lượng", value=dur, inline=True)
-        if player is not None:
-            pos = _queue_position(player, query)
-            if pos is not None:
-                embed.add_field(name="Thông tin Queue", value=pos, inline=True)
-        lyrics = (info.get("plainLyrics") or "").strip()
-        if lyrics:
-            snippet = lyrics if len(lyrics) <= 400 else lyrics[:397] + "…"
-            embed.add_field(name="Lời (trích)", value=snippet, inline=False)
-        embed.set_footer(text="Nguồn: lrclib.net")
-        return embed, None
-
-    # Không query -> bài đang phát (full info).
-    if player is None or player.current is None:
-        return (None,
-                "Hiện không có bài nào đang phát. Dùng `csonginfo <tên bài>` "
-                "để tra theo tên.")
-    t = player.current
-    embed = discord.Embed(
-        title="Thông tin bài hát",
-        color=discord.Color.blurple(),
-    )
+def build_track_info_embed(player, track: "Track", is_current: bool) -> discord.Embed:
+    """Dựng embed thông tin đầy đủ cho 1 Track (đang phát hoặc trong queue)."""
+    t = track
+    embed = discord.Embed(title="Thông tin bài hát",
+                          color=discord.Color.blurple())
     embed.add_field(
         name="Bài", value=f"**{_short_title(t.title, 200)}**", inline=False)
     if t.uploader:
@@ -4710,7 +5385,8 @@ async def get_songinfo(guild_id: int, query: Optional[str] = None):
     dur = _fmt_duration(t.duration)
     if dur:
         embed.add_field(name="Thời lượng", value=dur, inline=True)
-    embed.add_field(name="Người yêu cầu", value=t.requester or "—", inline=True)
+    embed.add_field(name="Người yêu cầu", value=t.requester or "—",
+                    inline=True)
 
     # Nguồn bài hát + link.
     src = t.source or _detect_source(t.web_url)
@@ -4746,34 +5422,161 @@ async def get_songinfo(guild_id: int, query: Optional[str] = None):
     embed.add_field(name="Nguồn bài hát",
                     value="\n".join(src_lines), inline=False)
 
-    # Thông tin Queue.
-    remaining = len(player.queue)
-    embed.add_field(
-        name="Thông tin Queue",
-        value=f"Vị trí: Đang phát\nCòn lại: {remaining} bài",
-        inline=True)
+    if is_current:
+        remaining = len(player.queue)
+        embed.add_field(
+            name="Thông tin Queue",
+            value=f"Vị trí: Đang phát\nCòn lại: {remaining} bài",
+            inline=True)
+        vol = player.volume * 100
+        paused = "Có" if (player.voice and player.voice.is_paused()) else "Không"
+        elapsed = (time.monotonic() - player.current_started) \
+            if player.current_started else 0.0
+        prog = _progress_bar(elapsed, t.duration)
+        extra = (f"Âm lượng: {vol:.1f}%\nTạm dừng: {paused}\nTiến độ:\n{prog}")
+        qual = []
+        if t.codec:
+            qual.append(f"Codec: {t.codec}")
+        if t.bitrate:
+            qual.append(f"Bitrate: {t.bitrate:.0f} kbps")
+        if t.sample_rate:
+            qual.append(f"Sample Rate: {t.sample_rate} Hz")
+        if t.channels is not None:
+            qual.append(f"Channels: {t.channels}")
+        if qual:
+            extra += "\nChất lượng âm thanh:\n" + "\n".join(qual)
+        embed.add_field(name="Đang phát", value=extra, inline=False)
+        embed.set_footer(text="Nhạc cho server")
+    else:
+        pos_in_queue = (player.queue.index(t) + 1) if t in player.queue else 0
+        embed.add_field(
+            name="Thông tin Queue",
+            value=f"Vị trí: #{pos_in_queue} trong hàng đợi",
+            inline=True)
+        embed.set_footer(text="Nhạc cho server")
+    return embed
 
-    # Chỉ bài đang phát: Volume, Paused, tiến độ, chất lượng âm thanh.
-    vol = player.volume * 100
-    paused = "Có" if (player.voice and player.voice.is_paused()) else "Không"
-    elapsed = (time.monotonic() - player.current_started) \
-        if player.current_started else 0.0
-    prog = _progress_bar(elapsed, t.duration)
-    extra = (f"Âm lượng: {vol:.1f}%\nTạm dừng: {paused}\nTiến độ:\n{prog}")
-    qual = []
-    if t.codec:
-        qual.append(f"Codec: {t.codec}")
-    if t.bitrate:
-        qual.append(f"Bitrate: {t.bitrate:.0f} kbps")
-    if t.sample_rate:
-        qual.append(f"Sample Rate: {t.sample_rate} Hz")
-    if t.channels is not None:
-        qual.append(f"Channels: {t.channels}")
-    if qual:
-        extra += "\nChất lượng âm thanh:\n" + "\n".join(qual)
-    embed.add_field(name="Đang phát", value=extra, inline=False)
-    embed.set_footer(text="Nhạc cho server")
-    return embed, None
+
+def _parse_songinfo_token(tok: str):
+    """Phân tích 1 token songinfo.
+    - 'c3' (tiền tố c) hoặc số thuần '3' -> ('pos', n)
+    - còn lại -> ('name', chuỗi)
+    Trả None nếu token rỗng.
+    """
+    t = (tok or "").strip()
+    if not t:
+        return None
+    m = re.fullmatch(r"[cC](\d+)", t)
+    if m:
+        return ("pos", int(m.group(1)))
+    if re.fullmatch(r"\d+", t):
+        return ("pos", int(t))
+    return ("name", t)
+
+
+async def _build_candidate_info_embed(player, cand: dict) -> discord.Embed:
+    """Dựng embed thông tin từ 1 candidate (dict trackName/artistName/...).
+    Bổ sung album/thời lượng/lời từ lrclib nếu có."""
+    name = cand.get("trackName") or "?"
+    artist = cand.get("artistName") or ""
+    q = f"{name} - {artist}".strip() if artist else name
+    info = await fetch_track_info(q)
+    embed = discord.Embed(title="Thông tin bài hát",
+                          color=discord.Color.blurple())
+    embed.add_field(
+        name="Bài", value=f"**{_short_title(name, 200)}**", inline=False)
+    if artist:
+        embed.add_field(name="Nghệ sĩ", value=artist, inline=True)
+    if info:
+        if info.get("albumName"):
+            embed.add_field(name="Album", value=info["albumName"], inline=True)
+        dur = _fmt_duration(info.get("duration"))
+        if dur:
+            embed.add_field(name="Thời lượng", value=dur, inline=True)
+        if player is not None:
+            p = _queue_position(player, name)
+            if p:
+                embed.add_field(name="Thông tin Queue", value=p, inline=True)
+        lyrics = (info.get("plainLyrics") or "").strip()
+        if lyrics:
+            snippet = lyrics if len(lyrics) <= 400 else lyrics[:397] + "…"
+            embed.add_field(name="Lời (trích)", value=snippet, inline=False)
+        embed.set_footer(text="Nguồn: lrclib.net")
+    else:
+        embed.set_footer(text=f"Nguồn: {cand.get('source') or '—'}")
+    return embed
+
+
+async def run_songinfo(guild_id: int,
+                       query: Optional[str] = None) -> "dict":
+    """Xử lý lệnh songinfo. Trả dict:
+    {embeds: [embed], errors: [str], pick: [candidates] hoặc None}.
+
+    - query rỗng: bài đang phát.
+    - token cách nhau bởi dấu phẩy:
+        * vị trí ('c3' / '3') -> bài ở vị trí đó trong queue.
+        * tên -> search_song_candidates; 1 kết quả hiện luôn, >1 đưa vào pick.
+    """
+    player = _guild_players.get(guild_id)
+
+    if not query or not query.strip():
+        if player is None or player.current is None:
+            return {"embeds": [], "errors": [
+                "Hiện không có bài nào đang phát. Dùng `csonginfo <tên bài>` "
+                "hoặc vị trí (vd `csonginfo c1,c2`) để tra."], "pick": None}
+        return {"embeds": [build_track_info_embed(player, player.current, True)],
+                "errors": [], "pick": None}
+
+    tokens = [t for t in (x.strip() for x in query.split(",")) if t]
+    embeds: "list" = []
+    errors: "list" = []
+    pick: "list" = []
+    seen_pick = set()
+    for tok in tokens:
+        parsed = _parse_songinfo_token(tok)
+        if parsed is None:
+            continue
+        kind, val = parsed
+        if kind == "pos":
+            pos = val
+            if player is None:
+                errors.append(f"Không có hàng đợi để tra vị trí {pos}.")
+                continue
+            if pos < 1 or pos > len(player.queue):
+                errors.append(
+                    f"Vị trí {pos} không hợp lệ (1–{len(player.queue)}).")
+                continue
+            tr = player.queue[pos - 1]
+            embeds.append(build_track_info_embed(player, tr, False))
+        else:
+            cands = await search_song_candidates(val)
+            if not cands:
+                errors.append(f"Không tìm thấy bài nào cho '{val}'.")
+                continue
+            if len(cands) == 1:
+                embeds.append(
+                    await _build_candidate_info_embed(player, cands[0]))
+            else:
+                for c in cands:
+                    k = _cand_key(c.get("trackName", ""), c.get("artistName", ""))
+                    if k in seen_pick:
+                        continue
+                    seen_pick.add(k)
+                    pick.append(c)
+    return {"embeds": embeds, "errors": errors,
+            "pick": pick if pick else None}
+
+
+async def get_songinfo(guild_id: int,
+                       query: Optional[str] = None) -> "list":
+    """Tương thích ngược: trả list (embed, error_text) như cũ."""
+    res = await run_songinfo(guild_id, query)
+    out = [(e, None) for e in res["embeds"]]
+    for err in res["errors"]:
+        out.append((None, err))
+    if res["pick"]:
+        out.append((None, "Có nhiều bài khớp, hãy chọn từ danh sách."))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -4801,8 +5604,8 @@ HELP_ENTRIES = [
     ("shuffle", "/shuffle  ||  cshuffle", "Xáo trộn hàng đợi (giữ bài đang phát)"),
     ("removeuser", "/removeuser [tên]  ||  cremoveuser [tên]", "Xóa mọi bài của 1 user khỏi queue"),
     ("lyrics", "/lyrics [tên]  ||  clyrics [tên]", "Lời bài hát (đang phát hoặc theo tên; AudD/lrclib/Musixmatch)"),
-    ("songinfo", "/songinfo [tên]  ||  csonginfo · csongin4 [tên]", "Thông tin bài hát: nguồn, queue, chất lượng âm thanh"),
-    ("nhaclyrics", "/nhaclyrics [đoạn]  ||  cnhaclyrics [đoạn]", "Tìm tên bài từ 1 đoạn lyrics (lrclib/Musixmatch)"),
+    ("songinfo", "/songinfo [tên|c1,c2]  ||  csonginfo · csongin4 [tên|c1,c2]", "Tra thông tin bài hát: vị trí queue (vd c1,c2) hoặc tên (nhiều bài -> chọn). Cách nhau bởi dấu phẩy."),
+    ("nhaclyrics", "/nhaclyrics [đoạn]  ||  cnhaclyrics [đoạn]", "Tìm tên bài từ 1 đoạn lyrics (lrclib/Musixmatch/Genius/NhacCuaTui)"),
     ("setkenh", "/setkenh  ||  csetkenh", "Owner: bật/tắt kênh chatbot"),
     ("setkenhmusic", "/setkenhmusic  ||  csetk...", "Owner: bật/tắt kênh lệnh nhạc"),
     ("disable / enable", "/disable · /enable  ||  cd·ce", "Owner: tắt/bật tính năng"),
@@ -5219,25 +6022,48 @@ async def handle_prefix(message: discord.Message) -> bool:
                             "để tra lời.")
                 return True
             name = player.current.title
-        async with channel.typing():
-            lyrics = await get_lyrics(name)
-        if not lyrics:
-            await reply(f"Không tìm thấy lời cho '{name}'.")
+            async with channel.typing():
+                lyrics = await get_lyrics(name)
+            if not lyrics:
+                await reply(f"Không tìm thấy lời cho '{name}'.")
+                return True
+            await send_long_message(
+                channel, f"**{name}**\n\n{lyrics}",
+                reference=message, delete_after=None)
             return True
-        await send_long_message(
-            channel, f"**{name}**\n\n{lyrics}",
-            reference=message, delete_after=None)
+        # Theo tên: candidate pick nếu nhiều bài.
+        async with channel.typing():
+            cands = await search_song_candidates(name)
+        if len(cands) <= 1:
+            async with channel.typing():
+                lyrics = await get_lyrics(name)
+            if not lyrics:
+                await reply(f"Không tìm thấy lời cho '{name}'.")
+                return True
+            await send_long_message(
+                channel, f"**{name}**\n\n{lyrics}",
+                reference=message, delete_after=None)
+            return True
+        view = LyricsPickView(message.author.id, cands)
+        await channel.send(
+            embed=view._build_embed(), view=view, reference=message,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
         return True
 
     if cmd in ("songinfo", "songin4"):
         async with channel.typing():
-            embed, err = await get_songinfo(guild.id, arg)
-        if err:
+            res = await run_songinfo(guild.id, arg)
+        for err in res["errors"]:
             await reply(err)
-            return True
-        await channel.send(
-            embed=embed, reference=message,
-            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        for embed in res["embeds"]:
+            await channel.send(
+                embed=embed, reference=message,
+                allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        if res["pick"]:
+            view = SongInfoPickView(message.author.id, guild.id, res["pick"])
+            await channel.send(embed=view._build_embed(), view=view,
+                               reference=message,
+                               allowed_mentions=SAFE_ALLOWED_MENTIONS)
         return True
 
     if cmd == "nhaclyrics":
@@ -5245,25 +6071,27 @@ async def handle_prefix(message: discord.Message) -> bool:
             await reply("Dùng: `cnhaclyrics <đoạn lyrics>`")
             return True
         async with channel.typing():
-            results = await search_songs_by_lyrics_multi(arg.strip())
-        if not results:
+            cands = await search_song_candidates(arg.strip())
+        if not cands:
             await reply("Không tìm thấy bài nào khớp đoạn lyrics đó.")
             return True
-        lines = []
-        for i, r in enumerate(results, start=1):
-            title = r.get("trackName") or "?"
-            artist = r.get("artistName") or ""
-            album = r.get("albumName") or ""
-            meta = " · ".join(p for p in (artist, album) if p)
-            lines.append(f"{i}. **{title}**" + (f" — {meta}" if meta else ""))
-        embed = discord.Embed(
-            title="Tìm bài theo lời",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        )
-        embed.set_footer(text=f"{len(results)} kết quả · nguồn lrclib.net")
+        if len(cands) == 1:
+            cand = cands[0]
+            async with channel.typing():
+                lyrics = await fetch_lyrics_for_candidate(cand)
+            if not lyrics:
+                await reply(f"Không tìm thấy lời cho '{cand['trackName']}'.")
+                return True
+            await send_long_message(
+                channel,
+                f"**{cand['trackName']}**"
+                + (f" — {cand['artistName']}" if cand['artistName'] else "")
+                + f"\n\n{lyrics}",
+                reference=message, delete_after=None)
+            return True
+        view = LyricsPickView(message.author.id, cands)
         await channel.send(
-            embed=embed, reference=message,
+            embed=view._build_embed(), view=view, reference=message,
             allowed_mentions=SAFE_ALLOWED_MENTIONS)
         return True
 
