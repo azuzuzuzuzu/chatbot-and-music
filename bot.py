@@ -19,6 +19,10 @@ import time
 import base64
 import asyncio
 import logging
+import random
+import hmac
+import hashlib
+import urllib.parse
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -84,7 +88,7 @@ FEATURE_LABELS = {
 }
 
 # Các giới hạn.
-COOLDOWN_SECONDS = 1          # Cooldown mỗi user.
+COOLDOWN_SECONDS = 2          # Cooldown mỗi user (khớp với mô tả ở đầu file).
 MAX_HISTORY_TURNS = 40        # Số lượt hội thoại giữ lại (30-50). 1 lượt = user + bot.
 MAX_DISCORD_MSG_LEN = 2000    # Giới hạn độ dài 1 tin nhắn Discord.
 MAX_SYSTEM_PROMPT_LEN = 3000  # Giới hạn độ dài system prompt user tự đặt.
@@ -106,7 +110,11 @@ YTDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
+    # YouTube hiện bắt giải mã signature (n/challenge) bằng JS runtime. Thiếu
+    # challenge solver -> "Only images are available" -> "format not available".
+    # Bật remote-components để yt-dlp tự tải solver từ GitHub (cần mạng lần đầu).
+    # Phải là LIST (không phải string) khi truyền qua Python API, nếu không bị bỏ qua.
+    "remote_components": ["ejs:github"],
 }
 
 # Tùy chọn file cookie (session Google) để qua lỗi 403 của YouTube browse API
@@ -114,9 +122,7 @@ YTDL_OPTS = {
 # Cách lấy: đăng nhập YouTube trên browser, xuất cookie (extension "Get
 # cookies.txt" hoặc `yt-dlp --cookies-from-browser chrome`) thành file .txt,
 # rồi đặt YTDL_COOKIE_FILE trỏ tới file đó (biến môi trường trong .env).
-YTDL_COOKIE_FILE = os.environ.get("YTDL_COOKIE_FILE", "")
-if YTDL_COOKIE_FILE and os.path.isfile(YTDL_COOKIE_FILE):
-    YTDL_OPTS["cookiefile"] = YTDL_COOKIE_FILE
+# (Khối nạp cookie thực tế nằm SAU phần cấu hình logging — xem dưới.)
 
 # Đường dẫn libopus tự đặt (ưu tiên cao nhất khi opus không tự load).
 # - Đặt qua biến môi trường OPUS_LIB, hoặc sửa trực tiếp ở đây.
@@ -159,6 +165,27 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("chatbot")
+
+
+# --------------------------------------------------------------------------- #
+# Nạp cookie YouTube (phải SAU logging đã sẵn sàng)
+# --------------------------------------------------------------------------- #
+
+YTDL_COOKIE_FILE = os.environ.get("YTDL_COOKIE_FILE", "")
+if YTDL_COOKIE_FILE:
+    # Mở rộng ~ và chuẩn hóa đường dẫn (hỗ trợ đường dẫn tương đối/tóm tắt).
+    _cookie_path = os.path.expanduser(os.path.expandvars(YTDL_COOKIE_FILE))
+    if os.path.isfile(_cookie_path):
+        YTDL_OPTS["cookiefile"] = _cookie_path
+        log.info("Đã nạp cookie YouTube từ %s", _cookie_path)
+    else:
+        # Cookie đặt sai path -> yt-dlp vẫn chạy NHƯNG video age-restricted /
+        # bị chặn sẽ báo "Requested format is not available". Báo rõ để sửa.
+        log.warning(
+            "YTDL_COOKIE_FILE=%r không tồn tại -> KHÔNG nạp cookie. "
+            "Video age-restricted/chặn sẽ lỗi format. Kiểm tra lại path trong .env.",
+            YTDL_COOKIE_FILE,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -659,15 +686,45 @@ class Track:
                  stream_url: Optional[str] = None,
                  web_url: Optional[str] = None,
                  query: Optional[str] = None,
-                 duration: Optional[float] = None):
+                 duration: Optional[float] = None,
+                 source: Optional[str] = None,
+                 uploader: Optional[str] = None,
+                 upload_date: Optional[str] = None,
+                 view_count: Optional[int] = None,
+                 likes: Optional[int] = None,
+                 reposts: Optional[int] = None,
+                 genre: Optional[str] = None,
+                 album: Optional[str] = None,
+                 release: Optional[str] = None,
+                 popularity: Optional[int] = None,
+                 codec: Optional[str] = None,
+                 bitrate: Optional[float] = None,
+                 sample_rate: Optional[int] = None,
+                 channels: Optional[int] = None):
         self.title = title
         self.requester = requester
         self.stream_url = stream_url        # None nếu chưa resolve.
         self.web_url = web_url or query or ""
         self.query = query                  # Chuỗi search/link để resolve sau.
         self.duration = duration            # Tổng thời lượng (giây), nếu biết.
+        # Metadata nguồn + chất lượng âm thanh (lấy khi resolve).
+        self.source = source                # "youtube"/"spotify"/"soundcloud"/"file"
+        self.uploader = uploader            # Ca sĩ/Kênh (YouTube channel, Spotify artist...)
+        self.upload_date = upload_date      # YouTube: YYYYMMDD
+        self.view_count = view_count        # YouTube views
+        self.likes = likes                  # SoundCloud likes
+        self.reposts = reposts              # SoundCloud reposts
+        self.genre = genre                  # SoundCloud genre
+        self.album = album                  # Album (Spotify/YouTube)
+        self.release = release              # Spotify release date
+        self.popularity = popularity        # Spotify popularity
+        self.codec = codec                  # opus / aac / mp3 ...
+        self.bitrate = bitrate              # kbps (abr)
+        self.sample_rate = sample_rate      # Hz (asr)
+        self.channels = channels            # 2 / 1 ...
         self.resolved = stream_url is not None
-        self._resolving = False             # Chống resolve trùng.
+        self._resolving = False             # Chống resolve trùng (do _ensure_resolved quản lý).
+        self.resolve_failed = False         # Đã thử resolve thất bại -> resolver bỏ qua.
 
 
 class GuildPlayer:
@@ -737,6 +794,18 @@ class GuildPlayer:
                 track = self.queue.pop(0)
                 # Track có thể "lazy" (chưa resolve) — resolve đúng lúc phát.
                 if not (track.resolved and track.stream_url):
+                    if track.resolve_failed:
+                        # Đã thử resolve thất bại trước đó (resolver nền) ->
+                        # bỏ qua luôn, không tốn thêm 1 lượt yt-dlp.
+                        if self.text_channel is not None:
+                            try:
+                                await self.text_channel.send(
+                                    f"⚠️ Bỏ qua (không phát được): **{track.title}**",
+                                    allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                                )
+                            except discord.HTTPException:
+                                pass
+                        continue
                     ok = await _ensure_resolved(track)
                     if not ok:
                         if self.text_channel is not None:
@@ -852,17 +921,17 @@ class GuildPlayer:
         try:
             while True:
                 pending = [t for t in list(self.queue)
-                           if not t.resolved and not t._resolving and t.query]
+                           if not t.resolved and not t._resolving
+                           and not t.resolve_failed and t.query]
                 if not pending:
                     return
 
                 async def one(tr: Track) -> None:
-                    tr._resolving = True
                     try:
                         async with sem:
                             await _ensure_resolved(tr)
-                    finally:
-                        tr._resolving = False
+                    except Exception:  # noqa: BLE001
+                        log.error("Lỗi resolve nền track %r", tr.query)
 
                 await asyncio.gather(*(one(t) for t in pending[:10]))
         except asyncio.CancelledError:
@@ -904,6 +973,20 @@ def _is_direct_audio(url: str) -> bool:
     return path.startswith(("http://", "https://")) and path.endswith(DIRECT_AUDIO_EXTS)
 
 
+def _detect_source(url: Optional[str]) -> str:
+    """Nhận diện nguồn từ web_url: youtube / spotify / soundcloud / file / other."""
+    u = (url or "").lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return "youtube"
+    if "spotify.com" in u or u.startswith("spotify:"):
+        return "spotify"
+    if "soundcloud.com" in u:
+        return "soundcloud"
+    if u.startswith(("http://", "https://")):
+        return "file"
+    return "other"
+
+
 async def resolve_track(query: str, requester: str) -> Optional[Track]:
     """
     Biến 1 link/từ khóa thành Track có stream URL.
@@ -921,26 +1004,46 @@ async def resolve_track(query: str, requester: str) -> Optional[Track]:
         title = query.split("/")[-1].split("?", 1)[0] or "audio"
         return Track(title, requester, stream_url=query, web_url=query)
 
+    # Link YouTube watch có kèm playlist/radio (list=..., start_radio=1) ->
+    # chỉ lấy đúng 1 bài, bỏ các tham số đó. Đặc biệt link radio/mix
+    # (list bắt đầu RD) khiến yt-dlp báo "Requested format is not available".
+    if "youtube.com" in query or "youtu.be" in query:
+        query = _strip_youtube_playlist(query)
+
     # Còn lại: cần yt-dlp.
     if yt_dlp is None:
         log.error("yt-dlp chưa được cài đặt — không resolve được link này.")
         return None
 
     def _extract() -> Optional[dict]:
-        """Chạy yt-dlp (blocking) trong thread riêng."""
-        try:
-            with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-                info = ydl.extract_info(query, download=False)
-            # Nếu là kết quả tìm kiếm/playlist, lấy entry đầu tiên.
-            if info and "entries" in info:
-                entries = [e for e in info["entries"] if e]
-                if not entries:
-                    return None
-                info = entries[0]
-            return info
-        except Exception as e:  # noqa: BLE001
-            log.error("yt-dlp lỗi khi resolve %r: %s", query, e)
-            return None
+        """Chạy yt-dlp (blocking) trong thread riêng.
+
+        Thử nhiều format: trước là ``bestaudio/best`` (chỉ audio), nếu YouTube
+        báo "Requested format is not available" thì fallback sang ``best``
+        (video+audio, ffmpeg tách audio qua ``-vn``).
+        """
+        # Copy để không đổi YTDL_OPTS gốc; thử từng format tới khi được.
+        opts_list = [
+            YTDL_OPTS,
+            {**YTDL_OPTS, "format": "best"},
+        ]
+        last_err: Optional[Exception] = None
+        for opts in opts_list:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(query, download=False)
+                # Nếu là kết quả tìm kiếm/playlist, lấy entry đầu tiên.
+                if info and "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    if not entries:
+                        continue
+                    info = entries[0]
+                return info
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        log.error("yt-dlp lỗi khi resolve %r: %s", query, last_err)
+        return None
 
     info = await asyncio.to_thread(_extract)
     if not info:
@@ -951,8 +1054,23 @@ async def resolve_track(query: str, requester: str) -> Optional[Track]:
         return None
     title = info.get("title") or "Unknown"
     web_url = info.get("webpage_url") or query
-    return Track(title, requester, stream_url=stream_url, web_url=web_url,
-                 duration=info.get("duration"))
+    return Track(
+        title, requester, stream_url=stream_url, web_url=web_url,
+        duration=info.get("duration"),
+        source=_detect_source(web_url),
+        uploader=info.get("uploader") or info.get("channel")
+                  or info.get("artist") or info.get("uploader_id"),
+        upload_date=info.get("upload_date"),
+        view_count=info.get("view_count"),
+        likes=info.get("like_count"),
+        reposts=info.get("reposts_count"),
+        genre=info.get("genre"),
+        album=info.get("album"),
+        codec=info.get("acodec"),
+        bitrate=info.get("abr"),
+        sample_rate=info.get("asr"),
+        channels=info.get("audio_channels"),
+    )
 
 
 async def _ensure_resolved(track: Track) -> bool:
@@ -961,30 +1079,54 @@ async def _ensure_resolved(track: Track) -> bool:
 
     Dùng cho cả _play_next (resolve đúng lúc phát) lẫn resolver nền.
 
-    Nếu 1 luồng khác (resolver nền) đang resolve track này, ta đợi nó xong
-    thay vì chạy yt-dlp thêm lần nữa (tránh resolve trùng, tốn tài nguyên).
+    Quản lý cờ ``_resolving`` TỰ NÓ: đặt True trước khi gọi yt-dlp, False sau.
+    Nếu 1 task khác (resolver nền hoặc _play_next) đang resolve track này,
+    ta đợi nó xong thay vì chạy yt-dlp thêm lần nữa (tránh resolve trùng).
+    Khi resolve thất bại, đặt ``resolve_failed`` để resolver nền không lặp
+    vô hạn với link hỏng.
     """
     if track.resolved and track.stream_url:
         return True
     if not track.query:
         return False
-    # Đang resolve bởi luồng khác -> chờ (tối đa ~10s) rồi kiểm lại.
+    # Task khác đang resolve track này -> chờ (tối đa ~10s) rồi kiểm lại.
     if track._resolving:
         for _ in range(100):
             await asyncio.sleep(0.1)
             if track.resolved and track.stream_url:
                 return True
         # Hết thời gian chờ vẫn chưa xong -> tự resolve bên dưới.
-    resolved = await resolve_track(track.query, track.requester)
+    track._resolving = True
+    try:
+        resolved = await resolve_track(track.query, track.requester)
+    finally:
+        track._resolving = False
     # Kiểm lại sau await: có thể luồng khác đã resolve track này rồi.
     if track.resolved and track.stream_url:
         return True
     if resolved is None or not resolved.stream_url:
+        track.resolve_failed = True
         return False
     track.stream_url = resolved.stream_url
     track.title = resolved.title
     track.web_url = resolved.web_url
     track.duration = resolved.duration
+    # Giữ metadata preset (vd Spotify thread qua music_play) nếu có,
+    # không thì lấy từ kết quả resolve (YouTube/SoundCloud).
+    track.source = track.source or resolved.source
+    track.uploader = track.uploader or resolved.uploader
+    track.upload_date = track.upload_date or resolved.upload_date
+    track.view_count = track.view_count or resolved.view_count
+    track.likes = track.likes if track.likes is not None else resolved.likes
+    track.reposts = track.reposts if track.reposts is not None else resolved.reposts
+    track.genre = track.genre or resolved.genre
+    track.album = track.album or resolved.album
+    track.release = track.release or resolved.release
+    track.popularity = track.popularity if track.popularity is not None else resolved.popularity
+    track.codec = track.codec or resolved.codec
+    track.bitrate = track.bitrate if track.bitrate is not None else resolved.bitrate
+    track.sample_rate = track.sample_rate if track.sample_rate is not None else resolved.sample_rate
+    track.channels = track.channels if track.channels is not None else resolved.channels
     track.resolved = True
     return True
 
@@ -1072,8 +1214,11 @@ async def _spotify_get(path: str, token: str,
         return None
 
 
-def _track_to_query(track: dict) -> Optional[str]:
-    """Biến 1 track object Spotify thành chuỗi search 'Tên bài Nghệ sĩ'."""
+def _spotify_track_meta(track: dict) -> "Optional[dict]":
+    """Biến 1 track object Spotify thành dict metadata để search YouTube.
+
+    Trả {"query","album","artist","release","popularity"} hoặc None.
+    """
     if not track:
         return None
     name = track.get("name")
@@ -1081,16 +1226,23 @@ def _track_to_query(track: dict) -> Optional[str]:
         return None
     artists = track.get("artists") or []
     artist_names = " ".join(a.get("name", "") for a in artists).strip()
-    return f"{name} {artist_names}".strip()
+    album = (track.get("album") or {}).get("name") or ""
+    release = (track.get("album") or {}).get("release_date") or ""
+    popularity = track.get("popularity")
+    query = f"{name} {artist_names}".strip()
+    if not query:
+        return None
+    return {"query": query, "album": album, "artist": artist_names,
+            "release": release, "popularity": popularity}
 
 
-async def resolve_spotify(url: str) -> List[str]:
+async def resolve_spotify(url: str) -> "List[dict]":
     """
-    Lấy metadata Spotify -> danh sách query search YouTube.
+    Lấy metadata Spotify -> danh sách dict {"query","album","artist",...}.
 
-    - track    -> 1 query.
-    - album    -> nhiều query (các bài trong album).
-    - playlist -> nhiều query (các bài trong playlist).
+    - track    -> 1 bài.
+    - album    -> nhiều bài (danh sách bài trong album).
+    - playlist -> nhiều bài (danh sách bài trong playlist).
     Giới hạn theo MAX_QUEUE_LEN. Trả [] nếu thiếu credentials / lỗi.
     """
     m = _SPOTIFY_RE.search(url)
@@ -1103,59 +1255,68 @@ async def resolve_spotify(url: str) -> List[str]:
         log.warning("Thiếu SPOTIFY_CLIENT_ID/SECRET hoặc lấy token thất bại.")
         return []
 
-    queries: List[str] = []
+    out: "List[dict]" = []
 
     if kind == "track":
         data = await _spotify_get(f"/tracks/{sid}", token)
-        q = _track_to_query(data) if data else None
-        if q:
-            queries.append(q)
-        return queries
+        meta = _spotify_track_meta(data) if data else None
+        if meta:
+            out.append(meta)
+        return out
 
     if kind == "album":
         offset = 0
-        while len(queries) < MAX_QUEUE_LEN:
+        coll_name = ""
+        ad = await _spotify_get(f"/albums/{sid}", token)
+        if ad:
+            coll_name = (ad.get("album") or {}).get("name") or ""
+        while len(out) < MAX_QUEUE_LEN:
             data = await _spotify_get(
                 f"/albums/{sid}/tracks", token,
                 params={"limit": 50, "offset": offset},
             )
             if not data:
                 break
-            items = data.get("items") or []
-            for tr in items:
-                q = _track_to_query(tr)
-                if q:
-                    queries.append(q)
-                if len(queries) >= MAX_QUEUE_LEN:
+            for tr in data.get("items") or []:
+                meta = _spotify_track_meta(tr)
+                if meta:
+                    meta["album"] = meta["album"] or coll_name
+                    out.append(meta)
+                if len(out) >= MAX_QUEUE_LEN:
                     break
             if not data.get("next"):
                 break
             offset += 50
-        return queries
+        return out
 
     if kind == "playlist":
         offset = 0
-        while len(queries) < MAX_QUEUE_LEN:
+        coll_name = ""
+        pd = await _spotify_get(f"/playlists/{sid}", token)
+        if pd:
+            coll_name = (pd.get("playlist") or {}).get("name") or ""
+        while len(out) < MAX_QUEUE_LEN:
             data = await _spotify_get(
                 f"/playlists/{sid}/tracks", token,
                 params={"limit": 100, "offset": offset,
-                        "fields": "items(track(name,artists(name))),next"},
+                        "fields": "items(track(name,artists(name),album(name),"
+                                  "popularity,release_date)),next"},
             )
             if not data:
                 break
-            items = data.get("items") or []
-            for it in items:
-                q = _track_to_query((it or {}).get("track"))
-                if q:
-                    queries.append(q)
-                if len(queries) >= MAX_QUEUE_LEN:
+            for it in data.get("items") or []:
+                meta = _spotify_track_meta((it or {}).get("track"))
+                if meta:
+                    meta["album"] = meta["album"] or coll_name
+                    out.append(meta)
+                if len(out) >= MAX_QUEUE_LEN:
                     break
             if not data.get("next"):
                 break
             offset += 100
-        return queries
+        return out
 
-    return queries
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1163,19 +1324,23 @@ async def resolve_spotify(url: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 def _youtube_has_playlist(url: str) -> bool:
-    """True nếu link YouTube có kèm playlist (tham số list=) và CÓ THỂ lấy được.
+    """True nếu link YouTube có kèm playlist (tham số list=), kể cả radio/mix.
 
-    Loại trừ playlist radio/mix tự sinh (list bắt đầu bằng RD...) — YouTube báo
-    'unviewable', không lấy được danh sách -> chỉ phát 1 bài thay vì hỏi playlist.
+    Playlist thường (PL/OL/UU/FL) lấy qua yt-dlp. Radio/mix (RD) endpoint
+    'playlist?list=RD' bị YouTube báo unviewable, nên lấy qua scrape trang
+    watch (playlistPanelVideoRenderer) — xem resolve_youtube_mix.
     """
     if "youtube.com" not in url and "youtu.be" not in url:
         return False
+    return bool(re.search(r"[?&]list=([A-Za-z0-9_-]+)", url))
+
+
+def _is_youtube_mix(url: str) -> bool:
+    """True nếu link YouTube là radio/mix tự sinh (tham số list= bắt đầu RD)."""
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return False
     m = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
-    if not m:
-        return False
-    if m.group(1).startswith("RD"):  # Radio / Mix tự sinh -> unviewable
-        return False
-    return True
+    return bool(m) and m.group(1).startswith("RD")
 
 
 def _is_spotify_collection(url: str) -> bool:
@@ -1211,6 +1376,172 @@ def _normalize_youtube_playlist_url(url: str) -> str:
     if m and "playlist?list=" not in url and "/playlist/" not in url:
         return f"https://www.youtube.com/playlist?list={m.group(1)}"
     return url
+
+
+# --------------------------------------------------------------------------- #
+# Lấy danh sách bài từ YouTube radio/mix (list=RD...) qua scrape trang watch.
+# Endpoint playlist?list=RD bị YouTube báo "unviewable" nên KHÔNG dùng yt-dlp;
+# thay vào đó parse ytInitialData -> playlistPanelVideoRenderer (như Lavaplayer
+# / NewPipe). Phương pháp này phụ thuộc cấu trúc JSON nội bộ của YouTube.
+# --------------------------------------------------------------------------- #
+
+def _render_text(node) -> str:
+    """Lấy text từ node title dạng {simpleText} hoặc {runs:[{text}]}."""
+    if not node:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        if "simpleText" in node:
+            return str(node["simpleText"])
+        if "runs" in node:
+            return "".join(str(r.get("text", "")) for r in node["runs"])
+    return ""
+
+
+def _extract_yt_initial_data(html: str) -> Optional[dict]:
+    """Trích dict ytInitialData từ HTML trang watch YouTube.
+
+    JSON lồng nhau có thể chứa '};' bên trong chuỗi, nên quét đếm ngoặc thay
+    vì regex tham lam/đóng.
+    """
+    m = re.search(r"var ytInitialData\s*=\s*(\{)", html)
+    if not m:
+        m = re.search(r"ytInitialData\"?\s*:\s*(\{)", html)
+    if not m:
+        return None
+    start = m.end() - 1  # vị trí dấu '{' đầu
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(html)):
+        ch = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+    return None
+
+
+def _find_mix_tracks(data: dict) -> List[dict]:
+    """Duyệt ytInitialData, thu thập playlistPanelVideoRenderer theo thứ tự."""
+    results: List[dict] = []
+    seen = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            r = node.get("playlistPanelVideoRenderer")
+            if isinstance(r, dict):
+                vid = r.get("videoId")
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    results.append({
+                        "videoId": vid,
+                        "title": _render_text(r.get("title")),
+                    })
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    return results
+
+
+def _load_netscape_cookies(path: str) -> Dict[str, str]:
+    """Đọc cookie Netscape (format yt-dlp) thành dict name->value.
+
+    Chỉ lấy cookie của youtube.com để gửi kèm request trang watch (tránh
+    màn hình consent / lấy được mix cá nhân hóa).
+    """
+    cookies: Dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, _, _, _, _, name, value = parts[:7]
+                if "youtube.com" in domain:
+                    cookies[name] = value
+    except OSError as e:
+        log.warning("Đọc cookie lỗi: %s", e)
+    return cookies
+
+
+async def _fetch_watch_page(url: str) -> Optional[str]:
+    """GET trang watch YouTube, trả về HTML (hoặc None nếu lỗi)."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept-Language": "vi-VN,vi;q=0.9",
+    }
+    cookie_file = YTDL_OPTS.get("cookiefile")
+    cookie_dict = _load_netscape_cookies(cookie_file) if cookie_file else {}
+    try:
+        async with aiohttp.ClientSession(
+            cookies=cookie_dict, headers=headers
+        ) as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("Watch page lỗi %s cho %s", resp.status, url)
+                    return None
+                return await resp.text()
+    except aiohttp.ClientError as e:
+        log.error("Lỗi fetch watch page %s: %s", url, e)
+        return None
+
+
+async def resolve_youtube_mix(player: "GuildPlayer", link: str,
+                              requester: str) -> int:
+    """Lấy toàn bộ bài từ radio/mix YouTube (list=RD) qua scrape trang watch.
+
+    Mỗi bài thành 1 Track "lazy" (query = watch URL), resolve nền dần qua
+    _resolve_ahead. Trả về số bài đã thêm (giới hạn MAX_QUEUE_LEN).
+    """
+    html = await _fetch_watch_page(link)
+    if not html:
+        return 0
+    data = _extract_yt_initial_data(html)
+    if not data:
+        log.warning("Không parse được ytInitialData cho mix %s", link)
+        return 0
+    tracks_meta = _find_mix_tracks(data)
+    if not tracks_meta:
+        log.warning("Không tìm thấy playlistPanelVideoRenderer cho mix %s", link)
+        return 0
+    space = max(0, MAX_QUEUE_LEN - len(player.queue))
+    tracks_meta = tracks_meta[:space]
+    if not tracks_meta:
+        return 0
+    for t in tracks_meta:
+        q = f"https://www.youtube.com/watch?v={t['videoId']}"
+        player.add(Track(t.get("title") or "Đang tải…", requester, query=q))
+    player.start_resolver()
+    return len(tracks_meta)
 
 
 async def _add_full_youtube_playlist(player: "GuildPlayer", url: str,
@@ -1446,8 +1777,13 @@ async def music_play(
     member: discord.Member,
     text_channel: discord.abc.Messageable,
     query: str,
+    meta: Optional[dict] = None,
 ) -> str:
-    """Logic chung cho /play và cplay. Trả về chuỗi thông báo cho user."""
+    """Logic chung cho /play và cplay. Trả về chuỗi thông báo cho user.
+
+    ``meta`` (tùy chọn): metadata nguồn gốc (vd Spotify) truyền từ
+    add_result_to_queue: {"source","album","artist","release","popularity"}.
+    """
     player, err = await ensure_voice(guild, member)
     if err:
         return err
@@ -1466,6 +1802,19 @@ async def music_play(
         return ("❌ Không lấy được nhạc từ link/từ khóa này. "
                 "Kiểm tra lại link, hoặc đảm bảo yt-dlp + ffmpeg đã cài.")
 
+    # Áp dụng metadata nguồn gốc (Spotify) nếu có.
+    if meta:
+        if meta.get("source"):
+            track.source = meta["source"]
+        if meta.get("album"):
+            track.album = meta["album"]
+        if meta.get("artist"):
+            track.uploader = track.uploader or meta["artist"]
+        if meta.get("release"):
+            track.release = meta["release"]
+        if meta.get("popularity") is not None:
+            track.popularity = meta["popularity"]
+
     player.add(track)
 
     # Nếu đang rảnh thì phát luôn; ngược lại báo đã thêm vào queue.
@@ -1480,16 +1829,28 @@ async def music_play(
 async def _play_spotify(player: "GuildPlayer", url: str,
                         requester: str) -> str:
     """Xử lý link Spotify: resolve metadata -> search YouTube -> thêm vào queue."""
-    queries = await resolve_spotify(url)
-    if not queries:
+    metas = await resolve_spotify(url)
+    if not metas:
         return ("❌ Không lấy được nhạc từ Spotify. "
                 "Cần cấu hình SPOTIFY_CLIENT_ID/SECRET, hoặc link không hợp lệ.")
     space = max(0, MAX_QUEUE_LEN - len(player.queue))
-    queries = queries[:space]
-    if not queries:
+    metas = metas[:space]
+    if not metas:
         return f"❌ Hàng đợi đã đầy (tối đa {MAX_QUEUE_LEN} bài)."
-    # Tạo Track "lazy" theo query — resolve dần ở background cho nhanh.
-    tracks = [Track(q, requester, query=q) for q in queries]
+    # Tạo Track "lazy" theo query, giữ metadata Spotify gốc để songinfo hiển thị.
+    tracks = []
+    for mt in metas:
+        t = Track(mt["query"], requester, query=mt["query"])
+        t.source = "spotify"
+        if mt.get("album"):
+            t.album = mt["album"]
+        if mt.get("artist"):
+            t.uploader = t.uploader or mt["artist"]
+        if mt.get("release"):
+            t.release = mt["release"]
+        if mt.get("popularity") is not None:
+            t.popularity = mt["popularity"]
+        tracks.append(t)
     for t in tracks:
         player.add(t)
     player.start_resolver()
@@ -1512,7 +1873,18 @@ async def play_full_playlist(guild: discord.Guild, member: discord.Member,
     if _is_spotify_collection(link):
         return await _play_spotify(player, link, member.display_name)
 
-    # YouTube playlist.
+    # YouTube radio/mix (list=RD): endpoint unviewable -> scrape trang watch.
+    if _is_youtube_mix(link):
+        added = await resolve_youtube_mix(player, link, member.display_name)
+        if added == 0:
+            return "❌ Không lấy được bài nào từ radio/mix này."
+        if not player.voice.is_playing() and not player.voice.is_paused():
+            await player.start_if_idle()
+            if added == 1:
+                return ""  # _play_next đã gửi tin.
+        return f"➕ Đã thêm {added} bài từ radio/mix vào hàng đợi."
+
+    # YouTube playlist thường (PL/OL/UU/FL).
     added = await _add_full_youtube_playlist(player, link, member.display_name)
     if added == 0:
         return "❌ Không lấy được bài nào từ playlist."
@@ -1628,6 +2000,56 @@ def music_skipto(guild_id: int, position: int) -> str:
         msg = f"Da bo qua den bai #{position} (het hang doi)."
     player.touch()
     return msg
+
+
+def music_shuffle(guild_id: int) -> str:
+    """Xáo trộn hàng đợi phía trước (giữ nguyên bài đang phát)."""
+    player = _guild_players.get(guild_id)
+    if player is None or (player.current is None and not player.queue):
+        return "Hàng đợi đang trống."
+    if not player.queue:
+        return "Chỉ có bài đang phát, không có bài nào trong hàng đợi để xáo trộn."
+    random.shuffle(player.queue)
+    player.touch()
+    return f"Đã xáo trộn {len(player.queue)} bài trong hàng đợi."
+
+
+def music_remove_user(guild_id: int, name: str) -> str:
+    """
+    Xóa mọi bài được yêu cầu bởi [name] khỏi queue VÀ bài đang phát.
+
+    Khớp không phân biệt hoa/thường theo track.requester (tên hiển thị).
+    Nếu bài đang phát trùng -> dừng để tự chuyển bài kế tiếp.
+    """
+    player = _guild_players.get(guild_id)
+    if player is None:
+        return "Bot không ở trong kênh thoại nào."
+    name = (name or "").strip().lower()
+    if not name:
+        return "❌ Thiếu tên user."
+    removed = 0
+    # Bài đang phát?
+    if (player.current is not None and player.current.requester
+            and player.current.requester.lower() == name):
+        removed += 1
+        player.current = None
+        if player.voice is not None and player.voice.is_connected():
+            try:
+                if player.voice.is_playing() or player.voice.is_paused():
+                    player.voice.stop()  # _after_play sẽ phát bài kế tiếp.
+            except discord.HTTPException as e:
+                log.error("Lỗi stop khi xóa user %s: %s", name, e)
+    # Lọc queue.
+    before = len(player.queue)
+    player.queue = [
+        t for t in player.queue
+        if not (t.requester and t.requester.lower() == name)
+    ]
+    removed += before - len(player.queue)
+    player.touch()
+    if removed == 0:
+        return f"Không có bài nào trong hàng đợi được yêu cầu bởi '{name}'."
+    return f"Đã xóa {removed} bài được yêu cầu bởi '{name}'."
 
 
 async def music_stop(guild_id: int) -> str:
@@ -2666,7 +3088,7 @@ async def act(interaction: discord.Interaction,
     description="Bỏ qua đến bài thứ N trong hàng đợi (1 = bài đầu, khớp /queue).",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(position="Vị trí (1 = bài đang phát, 2 = bài kế tiếp...)")
+@app_commands.describe(position="Vị trí (1 = bài kế tiếp, 2 = bài thứ 2...)")
 async def skipto(interaction: discord.Interaction, position: int):
     if is_feature_disabled(FEATURE_MUSIC):
         await interaction.response.send_message(
@@ -2799,6 +3221,9 @@ async def search_spotify_tracks(query: str,
             "title": name,
             "artist": artists,
             "url": (it.get("external_urls") or {}).get("spotify", ""),
+            "album": (it.get("album") or {}).get("name") or "",
+            "release": (it.get("album") or {}).get("release_date") or "",
+            "popularity": it.get("popularity"),
             "duration": (dur_ms / 1000) if dur_ms else None,
             "thumbnail": thumb,
             "source": "spotify",
@@ -2832,8 +3257,18 @@ async def add_result_to_queue(res: dict,
     member = interaction.user
     if not isinstance(member, discord.Member):
         return "❌ Không xác định được người dùng."
+    # Giữ metadata Spotify gốc (album/release/popularity) cho songinfo.
+    meta = None
+    if res.get("source") == "spotify":
+        meta = {
+            "source": "spotify",
+            "album": res.get("album"),
+            "artist": res.get("artist"),
+            "release": res.get("release"),
+            "popularity": res.get("popularity"),
+        }
     return await music_play(interaction.guild, member,
-                            interaction.channel, query)
+                            interaction.channel, query, meta=meta)
 
 
 class MusicResultSelect(discord.ui.Select):
@@ -3250,6 +3685,175 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     embed = build_nowplaying_embed(player)
     await interaction.response.send_message(
         embed=embed, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+
+
+@tree.command(
+    name="shuffle",
+    description="Xáo trộn hàng đợi (giữ nguyên bài đang phát).",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def shuffle_cmd(interaction: discord.Interaction):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    await interaction.response.send_message(
+        music_shuffle(interaction.guild.id),
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+
+
+@tree.command(
+    name="removeuser",
+    description="Xóa mọi bài được yêu cầu bởi 1 user khỏi hàng đợi.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(ten_user="Tên user cần xóa bài")
+async def removeuser_cmd(interaction: discord.Interaction, ten_user: str):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    if not ten_user or not ten_user.strip():
+        await interaction.response.send_message(
+            "❌ Dùng: `/removeuser <tên user>`", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        music_remove_user(interaction.guild.id, ten_user.strip()),
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+
+
+@tree.command(
+    name="lyrics",
+    description="Lấy lời bài hát đang phát, hoặc theo tên bài.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(ten_bai="Tên bài (bỏ trống = bài đang phát)")
+async def lyrics_cmd(interaction: discord.Interaction, ten_bai: str = ""):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    name = (ten_bai or "").strip()
+    if not name:
+        player = _guild_players.get(interaction.guild.id)
+        if player is None or player.current is None:
+            await interaction.response.send_message(
+                "Không có bài đang phát. Dùng `/lyrics <tên bài>` để tra lời.",
+                ephemeral=True)
+            return
+        name = player.current.title
+    await interaction.response.defer()
+    lyrics = await get_lyrics(name)
+    if not lyrics:
+        await interaction.followup.send(
+            f"Không tìm thấy lời cho '{name}'.", ephemeral=True)
+        return
+    # Gửi header rồi chia lời bài hát thành các phần (giới hạn Discord).
+    await interaction.followup.send(f"**{name}**")
+    await send_long_message(interaction.channel, lyrics)
+
+
+@tree.command(
+    name="songinfo",
+    description="Thông tin bài hát đang phát, hoặc tra theo tên bài.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(ten_bai="Tên bài (bỏ trống = bài đang phát)")
+async def songinfo_cmd(interaction: discord.Interaction, ten_bai: str = ""):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    await interaction.response.defer()
+    embed, err = await get_songinfo(interaction.guild.id, ten_bai or "")
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+    await interaction.followup.send(embed=embed,
+                                    allowed_mentions=SAFE_ALLOWED_MENTIONS)
+
+
+@tree.command(
+    name="nhaclyrics",
+    description="Tìm tên bài hát từ 1 đoạn lời bài hát.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(doan_lyrics="Đoạn lời bài hát cần tìm")
+async def nhaclyrics_cmd(interaction: discord.Interaction, doan_lyrics: str):
+    if is_feature_disabled(FEATURE_MUSIC):
+        await interaction.response.send_message(
+            feature_disabled_message(FEATURE_MUSIC), ephemeral=True)
+        return
+    if not is_correct_guild(interaction.guild):
+        await interaction.response.send_message(
+            "❌ Lệnh này chỉ dùng được trong server được cấu hình.",
+            ephemeral=True)
+        return
+    if not is_music_channel_allowed(interaction.channel.id):
+        await interaction.response.send_message(_music_channel_hint(),
+                                                ephemeral=True)
+        return
+    if not doan_lyrics or not doan_lyrics.strip():
+        await interaction.response.send_message(
+            "❌ Dùng: `/nhaclyrics <đoạn lyrics>`", ephemeral=True)
+        return
+    await interaction.response.defer()
+    results = await search_songs_by_lyrics_multi(doan_lyrics.strip())
+    if not results:
+        await interaction.followup.send(
+            "Không tìm thấy bài nào khớp đoạn lyrics đó.", ephemeral=True)
+        return
+    lines = []
+    for i, r in enumerate(results, start=1):
+        title = r.get("trackName") or "?"
+        artist = r.get("artistName") or ""
+        album = r.get("albumName") or ""
+        meta = " · ".join(p for p in (artist, album) if p)
+        lines.append(f"{i}. **{title}**" + (f" — {meta}" if meta else ""))
+    embed = discord.Embed(
+        title="Tìm bài theo lời",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"{len(results)} kết quả · nguồn lrclib.net")
+    await interaction.followup.send(embed=embed,
+                                    allowed_mentions=SAFE_ALLOWED_MENTIONS)
 
 
 @tree.command(
@@ -3749,6 +4353,543 @@ async def _handle_search_prefix(message: discord.Message,
 
 
 # --------------------------------------------------------------------------- #
+# Lyrics qua lrclib.net (API công khai, không cần key).
+# Dùng cho clyrics (tìm theo tên bài) và cnhaclyrics (tìm theo đoạn lyrics).
+# --------------------------------------------------------------------------- #
+
+LRCLIB_API = "https://lrclib.net/api/search"
+
+
+async def fetch_lyrics_by_track(track_name: str) -> Optional[str]:
+    """Lấy lyrics (plain) của 1 bài qua lrclib.net. Trả None nếu không tìm thấy."""
+    if not track_name:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                LRCLIB_API, params={"track": track_name},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi lrclib (by track %r): %s", track_name, e)
+        return None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        lyrics = (item.get("plainLyrics") or "").strip()
+        if lyrics:
+            return lyrics
+    return None
+
+
+async def search_songs_by_lyrics(query: str) -> "list":
+    """Tìm bài hát từ 1 đoạn lyrics qua lrclib.net. Trả list {trackName,artistName,albumName}."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                LRCLIB_API, params={"q": query},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi lrclib (by lyrics %r): %s", query, e)
+        return []
+    if not isinstance(data, list):
+        return []
+    out: "list" = []
+    for item in data:
+        name = item.get("trackName") or item.get("title") or ""
+        if not name:
+            continue
+        out.append({
+            "trackName": name,
+            "artistName": item.get("artistName") or "",
+            "albumName": item.get("albumName") or "",
+        })
+    return out[:SEARCH_TOTAL]
+
+
+async def fetch_track_info(track_name: str) -> "Optional[dict]":
+    """Tra thông tin bài hát (artist/album/duration/lyrics) qua lrclib.net.
+    Trả dict item đầu tiên có trackName, hoặc None nếu không tìm thấy."""
+    if not track_name:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                LRCLIB_API, params={"track": track_name},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi lrclib (info %r): %s", track_name, e)
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    for item in data:
+        if item.get("trackName"):
+            return item
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Nguồn lyrics đa dạng (fallback chain). Ưu tiên AudD nếu có key, không key thì
+# Musixmatch (không key, tiếng Việt tốt) -> lyrics.ovh -> lrclib. Mỗi nguồn bọc
+# try/except, fail thì qua nguồn kế. Musixmatch dùng API không chính thức
+# (HMAC token) — thỉnh thoảng bị rate-limit/captcha, nên luôn có fallback.
+# --------------------------------------------------------------------------- #
+
+_MXM_SECRET = "IEJ5E8XFaHQvIQNfs7IC"
+_MXM_APP_ID = "web-desktop-app-v1.0"
+_MXM_BASE = "https://apic-desktop.musixmatch.com/ws/1.1/"
+
+
+def _fmt_count(n) -> str:
+    """Định dạng số nguyên có dấu phẩy (vd 1,234,567)."""
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_uploaddate(s) -> str:
+    """YYYYMMDD -> YYYY-MM-DD (giữ nguyên nếu không đúng dạng)."""
+    s = (s or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s or "—"
+
+
+async def _mxm_call(method: str, params: dict,
+                     session: aiohttp.ClientSession) -> "Optional[dict]":
+    """Gọi Musixmatch unofficial API với HMAC signature."""
+    params = {"app_id": _MXM_APP_ID, "format": "json", **params}
+    qs = urllib.parse.urlencode(sorted(params.items()))
+    sig = hmac.new(_MXM_SECRET.encode(), qs.encode(), hashlib.sha1).hexdigest()
+    url = f"{_MXM_BASE}{method}?{qs}&signature={sig}&signature_protocol=sha1a"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        return await resp.json()
+
+
+async def fetch_lyrics_audd(track_name: str) -> Optional[str]:
+    """Lấy lyrics qua AudD getLyrics (cần AUDD_API_KEY). Trả None nếu fail."""
+    if not AUDD_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = aiohttp.FormData()
+            data.add_field("api_token", AUDD_API_KEY)
+            data.add_field("method", "getLyrics")
+            data.add_field("q", track_name)
+            async with session.post(
+                AUDD_API_URL, data=data,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                j = await resp.json()
+        if j.get("status") == "success":
+            ly = (j.get("result") or {}).get("lyrics") or ""
+            ly = ly.strip()
+            return ly or None
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi AudD getLyrics %r: %s", track_name, e)
+    return None
+
+
+async def fetch_lyrics_musixmatch(track_name: str) -> Optional[str]:
+    """Lấy lyrics qua Musixmatch unofficial (không key). Trả None nếu fail."""
+    track_name = (track_name or "").strip()
+    if not track_name:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            t = await _mxm_call(
+                "token.get", {"guid": str(int(time.time() * 1000))}, session)
+            tok = (t or {}).get("message", {}).get("body", {}).get("user_token")
+            if not tok:
+                return None
+            res = await _mxm_call(
+                "track.search",
+                {"q": track_name, "page_size": 5, "usertoken": tok},
+                session)
+            tracks = (res or {}).get("message", {}).get("body", {}) \
+                .get("track_list", [])
+            if not tracks:
+                return None
+            tid = tracks[0].get("track", {}).get("track_id")
+            if not tid:
+                return None
+            ly = await _mxm_call(
+                "track.lyrics.get",
+                {"track_id": tid, "usertoken": tok},
+                session)
+            body = (ly or {}).get("message", {}).get("body") or {}
+            lyrics = (body.get("lyrics", {}) or {}).get("lyrics_body") or ""
+            lyrics = lyrics.strip()
+            return lyrics or None
+    except (aiohttp.ClientError, ValueError, KeyError) as e:
+        log.error("Lỗi Musixmatch lyrics %r: %s", track_name, e)
+        return None
+
+
+async def fetch_lyrics_lyricsovh(track_name: str) -> Optional[str]:
+    """Lấy lyrics qua lyrics.ovh (không key, tổng hợp nhiều nguồn)."""
+    track_name = (track_name or "").strip()
+    if not track_name:
+        return None
+    # lyrics.ovh cần artist/title; tách trên " - " nếu có.
+    if " - " in track_name:
+        artist, title = track_name.split(" - ", 1)
+    else:
+        artist, title = "", track_name
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = (f"https://api.lyrics.ovh/v1/"
+                   f"{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}")
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        lyrics = (data.get("lyrics") or "").strip()
+        return lyrics or None
+    except (aiohttp.ClientError, ValueError) as e:
+        log.error("Lỗi lyrics.ovh %r: %s", track_name, e)
+        return None
+
+
+async def get_lyrics(track_name: str) -> Optional[str]:
+    """Lấy lyrics: AudD (nếu có key) -> Musixmatch -> lyrics.ovh -> lrclib."""
+    track_name = (track_name or "").strip()
+    if not track_name:
+        return None
+    if AUDD_API_KEY:
+        ly = await fetch_lyrics_audd(track_name)
+        if ly:
+            return ly
+    for fn in (fetch_lyrics_musixmatch, fetch_lyrics_lyricsovh,
+               fetch_lyrics_by_track):
+        try:
+            ly = await fn(track_name)
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi nguồn lyrics %s: %s",
+                      getattr(fn, "__name__", "?"), e)
+            ly = None
+        if ly:
+            return ly
+    return None
+
+
+async def search_songs_by_lyrics_musixmatch(query: str) -> "list":
+    """Tìm bài theo đoạn lyrics qua Musixmatch (q_lyrics). Trả list chuẩn hóa."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            t = await _mxm_call(
+                "token.get", {"guid": str(int(time.time() * 1000))}, session)
+            tok = (t or {}).get("message", {}).get("body", {}).get("user_token")
+            if not tok:
+                return []
+            res = await _mxm_call(
+                "track.search",
+                {"q_lyrics": query, "page_size": SEARCH_TOTAL, "usertoken": tok},
+                session)
+            tracks = (res or {}).get("message", {}).get("body", {}) \
+                .get("track_list", [])
+            out: "list" = []
+            for item in tracks:
+                tr = item.get("track", {})
+                name = tr.get("track_name") or ""
+                if not name:
+                    continue
+                out.append({
+                    "trackName": name,
+                    "artistName": tr.get("artist_name") or "",
+                    "albumName": tr.get("album_name") or "",
+                })
+            return out
+    except (aiohttp.ClientError, ValueError, KeyError) as e:
+        log.error("Lỗi Musixmatch search lyrics %r: %s", query, e)
+        return []
+
+
+async def search_songs_by_lyrics_multi(query: str) -> "list":
+    """Tìm bài theo đoạn lyrics: lrclib trước, fallback Musixmatch."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    results = await search_songs_by_lyrics(query)
+    if not results:
+        try:
+            results = await search_songs_by_lyrics_musixmatch(query)
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi Musixmatch search lyrics fallback: %s", e)
+    return results[:SEARCH_TOTAL]
+
+
+def _queue_position(player, query: str) -> Optional[str]:
+    """Tìm vị trí bài khớp query trong current + queue. Trả chuỗi hoặc None."""
+    q = (query or "").lower()
+    if not q:
+        return None
+    if player.current is not None and player.current.title \
+            and q in player.current.title.lower():
+        return "Đang phát"
+    for i, tr in enumerate(player.queue, start=1):
+        if tr.title and q in tr.title.lower():
+            return f"#{i} trong hàng đợi"
+    return None
+
+
+async def get_songinfo(guild_id: int, query: Optional[str] = None):
+    """Trả về (embed, None) khi thành công, hoặc (None, error_text).
+
+    - Có query: tra lrclib theo tên bài -> thông tin cơ bản + vị trí queue.
+    - Không query: lấy thông tin bài đang phát (full: nguồn + chất lượng).
+    """
+    query = (query or "").strip()
+    player = _guild_players.get(guild_id)
+
+    if query:
+        info = await fetch_track_info(query)
+        if not info:
+            return None, f"Không tìm thấy thông tin cho '{query}'."
+        embed = discord.Embed(
+            title="Thông tin bài hát",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Bài",
+            value=f"**{_short_title(info.get('trackName') or query, 200)}**",
+            inline=False)
+        if info.get("artistName"):
+            embed.add_field(name="Nghệ sĩ", value=info["artistName"], inline=True)
+        if info.get("albumName"):
+            embed.add_field(name="Album", value=info["albumName"], inline=True)
+        dur = _fmt_duration(info.get("duration"))
+        if dur:
+            embed.add_field(name="Thời lượng", value=dur, inline=True)
+        if player is not None:
+            pos = _queue_position(player, query)
+            if pos is not None:
+                embed.add_field(name="Thông tin Queue", value=pos, inline=True)
+        lyrics = (info.get("plainLyrics") or "").strip()
+        if lyrics:
+            snippet = lyrics if len(lyrics) <= 400 else lyrics[:397] + "…"
+            embed.add_field(name="Lời (trích)", value=snippet, inline=False)
+        embed.set_footer(text="Nguồn: lrclib.net")
+        return embed, None
+
+    # Không query -> bài đang phát (full info).
+    if player is None or player.current is None:
+        return (None,
+                "Hiện không có bài nào đang phát. Dùng `csonginfo <tên bài>` "
+                "để tra theo tên.")
+    t = player.current
+    embed = discord.Embed(
+        title="Thông tin bài hát",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Bài", value=f"**{_short_title(t.title, 200)}**", inline=False)
+    if t.uploader:
+        embed.add_field(name="Ca sĩ/Kênh", value=t.uploader, inline=True)
+    if t.album:
+        embed.add_field(name="Album", value=t.album, inline=True)
+    dur = _fmt_duration(t.duration)
+    if dur:
+        embed.add_field(name="Thời lượng", value=dur, inline=True)
+    embed.add_field(name="Người yêu cầu", value=t.requester or "—", inline=True)
+
+    # Nguồn bài hát + link.
+    src = t.source or _detect_source(t.web_url)
+    src_label = {
+        "youtube": "YouTube", "spotify": "Spotify",
+        "soundcloud": "SoundCloud", "file": "File", "other": "Khác",
+    }.get(src, src or "—")
+    src_lines = [f"**{src_label}**"]
+    if t.web_url:
+        src_lines.append(t.web_url)
+    if src == "youtube":
+        if t.uploader:
+            src_lines.append(f"Uploader: {t.uploader}")
+        ud = _fmt_uploaddate(t.upload_date)
+        if ud != "—":
+            src_lines.append(f"Upload: {ud}")
+        if t.view_count:
+            src_lines.append(f"Views: {_fmt_count(t.view_count)}")
+    elif src == "spotify":
+        if t.release:
+            src_lines.append(f"Release: {t.release}")
+        if t.popularity is not None:
+            src_lines.append(f"Popularity: {t.popularity}")
+        if t.album:
+            src_lines.append(f"Album: {t.album}")
+    elif src == "soundcloud":
+        if t.likes is not None:
+            src_lines.append(f"Likes: {_fmt_count(t.likes)}")
+        if t.reposts is not None:
+            src_lines.append(f"Reposts: {_fmt_count(t.reposts)}")
+        if t.genre:
+            src_lines.append(f"Genre: {t.genre}")
+    embed.add_field(name="Nguồn bài hát",
+                    value="\n".join(src_lines), inline=False)
+
+    # Thông tin Queue.
+    remaining = len(player.queue)
+    embed.add_field(
+        name="Thông tin Queue",
+        value=f"Vị trí: Đang phát\nCòn lại: {remaining} bài",
+        inline=True)
+
+    # Chỉ bài đang phát: Volume, Paused, tiến độ, chất lượng âm thanh.
+    vol = player.volume * 100
+    paused = "Có" if (player.voice and player.voice.is_paused()) else "Không"
+    elapsed = (time.monotonic() - player.current_started) \
+        if player.current_started else 0.0
+    prog = _progress_bar(elapsed, t.duration)
+    extra = (f"Âm lượng: {vol:.1f}%\nTạm dừng: {paused}\nTiến độ:\n{prog}")
+    qual = []
+    if t.codec:
+        qual.append(f"Codec: {t.codec}")
+    if t.bitrate:
+        qual.append(f"Bitrate: {t.bitrate:.0f} kbps")
+    if t.sample_rate:
+        qual.append(f"Sample Rate: {t.sample_rate} Hz")
+    if t.channels is not None:
+        qual.append(f"Channels: {t.channels}")
+    if qual:
+        extra += "\nChất lượng âm thanh:\n" + "\n".join(qual)
+    embed.add_field(name="Đang phát", value=extra, inline=False)
+    embed.set_footer(text="Nhạc cho server")
+    return embed, None
+
+
+# --------------------------------------------------------------------------- #
+# Trợ giúp (chelp): embed phân trang có nút ◀ ▶, liệt kê cả prefix + slash.
+# --------------------------------------------------------------------------- #
+
+# (tên lệnh, "các dạng gọi (prefix || slash)", mô tả)
+HELP_ENTRIES = [
+    ("play", "/play  ||  cplay", "Phát nhạc từ link (YouTube/SoundCloud/file) hoặc từ khóa"),
+    ("skip", "/skip  ||  cskip", "Bỏ qua bài hiện tại"),
+    ("stop", "/stop  ||  cstop", "Dừng nhạc, xóa queue, rời kênh thoại"),
+    ("pause / resume", "/pause · /resume  ||  cpause · cresume", "Tạm dừng / phát tiếp"),
+    ("queue", "/queue  ||  cqueue", "Xem hàng đợi nhạc"),
+    ("remove", "/remove  ||  cremove", "Xóa 1 bài khỏi queue theo vị trí"),
+    ("act", "/act  ||  cact", "Sắp xếp lại queue (move/up/down)"),
+    ("skipto", "/skipto  ||  cskipto", "Bỏ qua đến bài thứ N trong queue"),
+    ("volume", "/volume  ||  cvolume", "Chỉnh âm lượng (1.0-100.0)"),
+    ("nowplaying", "/nowplaying  ||  cnowplaying", "Xem bài đang phát + tiến độ"),
+    ("saveplaylist", "/saveplaylist  ||  csav...", "Lưu queue thành playlist cá nhân"),
+    ("playplaylist", "/playplaylist  ||  cplayp...", "Phát playlist đã lưu"),
+    ("mylists", "/mylists  ||  cmylists", "Danh sách playlist của bạn"),
+    ("deletelist", "/deletelist  ||  cdeletelist", "Xóa playlist cá nhân"),
+    ("nhac", "/nhac  ||  cnhac", "Tìm nhạc trên YouTube + Spotify"),
+    ("nhacfile", "/nhacfile  ||  cnhacfile", "Nhận diện bài từ file audio (AudD)"),
+    ("shuffle", "/shuffle  ||  cshuffle", "Xáo trộn hàng đợi (giữ bài đang phát)"),
+    ("removeuser", "/removeuser [tên]  ||  cremoveuser [tên]", "Xóa mọi bài của 1 user khỏi queue"),
+    ("lyrics", "/lyrics [tên]  ||  clyrics [tên]", "Lời bài hát (đang phát hoặc theo tên; AudD/lrclib/Musixmatch)"),
+    ("songinfo", "/songinfo [tên]  ||  csonginfo · csongin4 [tên]", "Thông tin bài hát: nguồn, queue, chất lượng âm thanh"),
+    ("nhaclyrics", "/nhaclyrics [đoạn]  ||  cnhaclyrics [đoạn]", "Tìm tên bài từ 1 đoạn lyrics (lrclib/Musixmatch)"),
+    ("setkenh", "/setkenh  ||  csetkenh", "Owner: bật/tắt kênh chatbot"),
+    ("setkenhmusic", "/setkenhmusic  ||  csetk...", "Owner: bật/tắt kênh lệnh nhạc"),
+    ("disable / enable", "/disable · /enable  ||  cd·ce", "Owner: tắt/bật tính năng"),
+    ("promptsys", "/promptsys", "Đặt personality riêng (chat)"),
+    ("rsprompt", "/rsprompt", "Reset personality về mặc định"),
+    ("xoa", "/xoa", "Xóa lịch sử chat của bạn"),
+    ("help", "chelp", "Hiện trợ giúp này (có phân trang)"),
+]
+
+HELP_PAGE_SIZE = 8
+
+
+def build_help_embed(page: int) -> discord.Embed:
+    """Dựng embed trợ giúp cho 1 trang (page 0-based)."""
+    total = max(1, (len(HELP_ENTRIES) + HELP_PAGE_SIZE - 1) // HELP_PAGE_SIZE)
+    page = max(0, min(page, total - 1))
+    embed = discord.Embed(
+        title="Trợ giúp sử dụng bot",
+        description=("Dùng prefix `c` + tên (vd `cplay`), hoặc slash command "
+                     "tương ứng. Chatbot: mention bot hoặc reply tin nhắn bot."),
+    )
+    start = page * HELP_PAGE_SIZE
+    chunk = HELP_ENTRIES[start:start + HELP_PAGE_SIZE]
+    for name, forms, desc in chunk:
+        embed.add_field(
+            name=name,
+            value=f"`{forms}`\n{desc}",
+            inline=False,
+        )
+    embed.set_footer(text=f"Trang {page + 1}/{total} · tổng {len(HELP_ENTRIES)} lệnh")
+    return embed
+
+
+class HelpView(discord.ui.View):
+    """View phân trang cho chelp: 2 nút ◀ ▶ lật trang."""
+
+    def __init__(self, timeout: float = 120.0):
+        super().__init__(timeout=timeout)
+        self.page = 0
+        self.message: Optional[discord.Message] = None
+        self._refresh()
+
+    def _refresh(self) -> None:
+        total = max(1, (len(HELP_ENTRIES) + HELP_PAGE_SIZE - 1) // HELP_PAGE_SIZE)
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= total - 1
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction,
+                       button: discord.ui.Button) -> None:
+        self.page -= 1
+        self._refresh()
+        await interaction.response.edit_message(
+            embed=build_help_embed(self.page), view=self)
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction,
+                       button: discord.ui.Button) -> None:
+        self.page += 1
+        self._refresh()
+        await interaction.response.edit_message(
+            embed=build_help_embed(self.page), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def _handle_help_prefix(message: discord.Message) -> None:
+    """Xử lý lệnh chelp: gửi embed trợ giúp phân trang."""
+    if not is_correct_guild(message.guild):
+        await _owner_reply(
+            message, "Lệnh này chỉ dùng được trong server được cấu hình.")
+        return
+    view = HelpView()
+    embed = build_help_embed(0)
+    view.message = await message.channel.send(
+        embed=embed, view=view, reference=message,
+        allowed_mentions=SAFE_ALLOWED_MENTIONS)
+
+
+# --------------------------------------------------------------------------- #
 # Sự kiện: nhận tin nhắn (luồng xử lý chatbot)
 # --------------------------------------------------------------------------- #
 
@@ -3782,13 +4923,19 @@ async def handle_prefix(message: discord.Message) -> bool:
     if cmd in ("nhac", "nhacfile"):
         return await _handle_search_prefix(message, cmd, arg)
 
+    # --- Trợ giúp (chelp) ---
+    if cmd == "help":
+        await _handle_help_prefix(message)
+        return True
+
     # --- Nhóm nhạc (music) ---
     # Chỉ các cmd này mới là lệnh nhạc. Tin thường bắt đầu "c" (vd "chao")
     # không khớp -> trả False để luồng chatbot xử lý.
     MUSIC_CMDS = {"play", "skip", "stop", "pause", "resume", "unpause",
                   "queue", "q", "remove", "rm", "act", "skipto",
                   "volume", "nowplaying", "saveplaylist", "playplaylist",
-                  "mylists", "deletelist"}
+                  "mylists", "deletelist", "shuffle", "removeuser",
+                  "lyrics", "songinfo", "songin4", "nhaclyrics"}
     if cmd not in MUSIC_CMDS:
         return False
 
@@ -4050,6 +5197,74 @@ async def handle_prefix(message: discord.Message) -> bool:
         if not _is_error_text(msg):
             player.touch()
             player.voice.stop()
+        return True
+
+    if cmd == "shuffle":
+        await reply(music_shuffle(guild.id))
+        return True
+
+    if cmd == "removeuser":
+        if not arg.strip():
+            await reply("Dùng: `cremoveuser <tên user>`")
+            return True
+        await reply(music_remove_user(guild.id, arg.strip()))
+        return True
+
+    if cmd == "lyrics":
+        name = arg.strip()
+        if not name:
+            player = _guild_players.get(guild.id)
+            if player is None or player.current is None:
+                await reply("Không có bài đang phát. Dùng `clyrics <tên bài>` "
+                            "để tra lời.")
+                return True
+            name = player.current.title
+        async with channel.typing():
+            lyrics = await get_lyrics(name)
+        if not lyrics:
+            await reply(f"Không tìm thấy lời cho '{name}'.")
+            return True
+        await send_long_message(
+            channel, f"**{name}**\n\n{lyrics}",
+            reference=message, delete_after=None)
+        return True
+
+    if cmd in ("songinfo", "songin4"):
+        async with channel.typing():
+            embed, err = await get_songinfo(guild.id, arg)
+        if err:
+            await reply(err)
+            return True
+        await channel.send(
+            embed=embed, reference=message,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
+        return True
+
+    if cmd == "nhaclyrics":
+        if not arg.strip():
+            await reply("Dùng: `cnhaclyrics <đoạn lyrics>`")
+            return True
+        async with channel.typing():
+            results = await search_songs_by_lyrics_multi(arg.strip())
+        if not results:
+            await reply("Không tìm thấy bài nào khớp đoạn lyrics đó.")
+            return True
+        lines = []
+        for i, r in enumerate(results, start=1):
+            title = r.get("trackName") or "?"
+            artist = r.get("artistName") or ""
+            album = r.get("albumName") or ""
+            meta = " · ".join(p for p in (artist, album) if p)
+            lines.append(f"{i}. **{title}**" + (f" — {meta}" if meta else ""))
+        embed = discord.Embed(
+            title="Tìm bài theo lời",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"{len(results)} kết quả · nguồn lrclib.net")
+        await channel.send(
+            embed=embed, reference=message,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS)
         return True
 
     return False
