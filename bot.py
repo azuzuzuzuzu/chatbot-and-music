@@ -3334,7 +3334,7 @@ class MusicSearchView(discord.ui.View):
         self.add_item(self.select)
         self.add_item(self.prev_btn)
         self.add_item(self.next_btn)
-        self._refresh()
+        self._refresh_buttons()
 
     def _page_count(self) -> int:
         return max(1, (len(self.results) + SEARCH_PAGE_SIZE - 1)
@@ -3377,7 +3377,7 @@ class MusicSearchView(discord.ui.View):
         embed.set_footer(text="Chỉ bạn mới bấm được các nút này.")
         return embed
 
-    def _refresh(self) -> None:
+    def _refresh_buttons(self) -> None:
         pages = self._page_count()
         self.select.options = self._page_options()
         self.prev_btn.disabled = self.page <= 0
@@ -3386,14 +3386,14 @@ class MusicSearchView(discord.ui.View):
     async def _on_prev(self, interaction: discord.Interaction) -> None:
         if self.page > 0:
             self.page -= 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(embed=self._build_embed(),
                                                 view=self)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
         if self.page < self._page_count() - 1:
             self.page += 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(embed=self._build_embed(),
                                                 view=self)
 
@@ -3484,7 +3484,7 @@ class LyricsPickView(discord.ui.View):
         self.add_item(self.show_btn)
         self.add_item(self.prev_btn)
         self.add_item(self.next_btn)
-        self._refresh()
+        self._refresh_buttons()
 
     def _page_count(self) -> int:
         return max(1, (len(self.candidates) + LYRICS_PICK_PAGE - 1)
@@ -3529,7 +3529,7 @@ class LyricsPickView(discord.ui.View):
         embed.set_footer(text="Chi ban moi bam duoc cac nut nay.")
         return embed
 
-    def _refresh(self) -> None:
+    def _refresh_buttons(self) -> None:
         pages = self._page_count()
         self.select.options = self._page_options()
         self.prev_btn.disabled = self.page <= 0
@@ -3580,14 +3580,14 @@ class LyricsPickView(discord.ui.View):
     async def _on_prev(self, interaction: discord.Interaction) -> None:
         if self.page > 0:
             self.page -= 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(
             embed=self._build_embed(), view=self)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
         if self.page < self._page_count() - 1:
             self.page += 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(
             embed=self._build_embed(), view=self)
 
@@ -3656,7 +3656,7 @@ class SongInfoPickView(discord.ui.View):
         self.add_item(self.show_btn)
         self.add_item(self.prev_btn)
         self.add_item(self.next_btn)
-        self._refresh()
+        self._refresh_buttons()
 
     def _page_count(self) -> int:
         return max(1, (len(self.candidates) + LYRICS_PICK_PAGE - 1)
@@ -3701,7 +3701,7 @@ class SongInfoPickView(discord.ui.View):
         embed.set_footer(text="Chi ban moi bam duoc cac nut nay.")
         return embed
 
-    def _refresh(self) -> None:
+    def _refresh_buttons(self) -> None:
         pages = self._page_count()
         self.select.options = self._page_options()
         self.prev_btn.disabled = self.page <= 0
@@ -3747,14 +3747,14 @@ class SongInfoPickView(discord.ui.View):
     async def _on_prev(self, interaction: discord.Interaction) -> None:
         if self.page > 0:
             self.page -= 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(
             embed=self._build_embed(), view=self)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
         if self.page < self._page_count() - 1:
             self.page += 1
-            self._refresh()
+            self._refresh_buttons()
         await interaction.response.edit_message(
             embed=self._build_embed(), view=self)
 
@@ -4919,9 +4919,9 @@ async def fetch_lyrics_lyricsovh(track_name: str) -> Optional[str]:
     track_name = (track_name or "").strip()
     if not track_name:
         return None
-    # lyrics.ovh cần artist/title; tách trên " - " nếu có.
+    # lyrics.ovh cần /v1/{artist}/{title}; track_name có dạng "tên - artist".
     if " - " in track_name:
-        artist, title = track_name.split(" - ", 1)
+        title, artist = track_name.split(" - ", 1)
     else:
         artist, title = "", track_name
     try:
@@ -5344,17 +5344,68 @@ async def search_song_candidates(query: str) -> "list":
     return out[:LYRICS_PICK_TOTAL]
 
 
+def _norm_title(t: str) -> str:
+    """Chuẩn hóa tên bài để so khớp (viết thường, bỏ ngoặc, bỏ dấu câu)."""
+    t = (t or "").lower()
+    t = re.sub(r"\([^)]*\)", " ", t)
+    t = re.sub(r"\[[^\]]*\]", " ", t)
+    t = re.sub(r"[^a-z0-9à-ỹ\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _genius_url_matches(title: str, name: str) -> bool:
+    """Tránh lấy nhầm bài (vd parody) khi scrape Genius fallback."""
+    if not name:
+        return True
+    a, b = _norm_title(title), _norm_title(name)
+    if not a or not b:
+        return True
+    return (a == b) or (b in a) or (a in b)
+
+
 async def fetch_lyrics_for_candidate(cand: dict) -> Optional[str]:
-    """Lấy lyrics cho candidate đã chọn. Genius -> scrape url;
-    khác -> get_lyrics(tên - artist)."""
+    """Lấy lyrics cho candidate đã chọn.
+
+    Thứ tự:
+    1. Nếu candidate trỏ thẳng vào trang bài hát Genius -> scrape luôn.
+    2. Fallback chuỗi nguồn (AudD/Musixmatch/lyrics.ovh/lrclib) qua get_lyrics.
+    3. Nếu vẫn không có -> tìm trên Genius bằng tên+artist, scrape trang
+       khớp nhất (nhiều bài Việt / ít phổ biến chỉ có lyrics trên Genius).
+    """
     name = cand.get("trackName") or ""
     artist = cand.get("artistName") or ""
-    if cand.get("source") == "genius" and cand.get("web_url"):
-        ly = await fetch_lyrics_genius(cand["web_url"])
+    # 1. Trang Genius thật (web_url không phải trang search).
+    gu = cand.get("web_url") or ""
+    if cand.get("source") == "genius" and gu and "/search" not in gu:
+        ly = await fetch_lyrics_genius(gu)
         if ly:
             return ly
+    # 2. Chuỗi nguồn chuẩn.
     q = f"{name} - {artist}".strip() if artist else name
-    return await get_lyrics(q)
+    ly = await get_lyrics(q)
+    if ly:
+        return ly
+    # 3. Fallback Genius: search tên+artist, scrape trang khớp nhất.
+    if name:
+        try:
+            gres = await search_genius_songs(f"{name} {artist}".strip())
+        except Exception as e:  # noqa: BLE001
+            log.error("Lỗi Genius fallback cho %r: %s", name, e)
+            gres = []
+        for gc in gres[:5]:
+            url = gc.get("web_url") or ""
+            if not url or "/search" in url:
+                continue
+            if not _genius_url_matches(gc.get("trackName", ""), name):
+                continue
+            try:
+                ly = await fetch_lyrics_genius(url)
+            except Exception as e:  # noqa: BLE001
+                log.error("Lỗi scrape Genius fallback %s: %s", url, e)
+                ly = None
+            if ly:
+                return ly
+    return None
 
 
 def _queue_position(player, query: str) -> Optional[str]:
@@ -5646,9 +5697,9 @@ class HelpView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.page = 0
         self.message: Optional[discord.Message] = None
-        self._refresh()
+        self._refresh_buttons()
 
-    def _refresh(self) -> None:
+    def _refresh_buttons(self) -> None:
         total = max(1, (len(HELP_ENTRIES) + HELP_PAGE_SIZE - 1) // HELP_PAGE_SIZE)
         self.prev_btn.disabled = self.page <= 0
         self.next_btn.disabled = self.page >= total - 1
@@ -5657,7 +5708,7 @@ class HelpView(discord.ui.View):
     async def prev_btn(self, interaction: discord.Interaction,
                        button: discord.ui.Button) -> None:
         self.page -= 1
-        self._refresh()
+        self._refresh_buttons()
         await interaction.response.edit_message(
             embed=build_help_embed(self.page), view=self)
 
@@ -5665,7 +5716,7 @@ class HelpView(discord.ui.View):
     async def next_btn(self, interaction: discord.Interaction,
                        button: discord.ui.Button) -> None:
         self.page += 1
-        self._refresh()
+        self._refresh_buttons()
         await interaction.response.edit_message(
             embed=build_help_embed(self.page), view=self)
 

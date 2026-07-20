@@ -175,6 +175,26 @@ TÌM KIẾM NHẠC (YouTube + Spotify):
     - Spotify chỉ có kết quả nếu đã cấu hình SPOTIFY_CLIENT_ID / SECRET.
 
 
+LỜI BÀI HÁT (LYRICS):
+    Lệnh slash:
+        /lyrics [tên_bài]      Xem lời bài hát.
+                                 - Không ghi tên: lấy lời bài ĐANG PHÁT (nếu có).
+                                 - Ghi tên: tìm bài, nhiều kết quả hiện dropdown
+                                   chọn; 1 kết quả hiện luôn.
+        /nhaclyrics <đoạn>     Tìm bài từ 1 đoạn lời bạn nhớ (vd một câu hát),
+                               hiện dropdown chọn bài rồi hiện lời.
+    Lệnh prefix tương ứng:
+        clyrics [tên_bài]      (tương đương /lyrics)
+        cnhaclyrics <đoạn>     (tương đương /nhaclyrics)
+    - Khi nhiều bài khớp: bot hiện danh sách (dropdown 5 bài/trang, 15 tổng) +
+      nút "Hiện lyrics" + ◀ ▶ phân trang. Chỉ người gọi bấm được.
+    - Lời bài hát được gửi CÔNG KHAI ra kênh (không chỉ mình bạn xem).
+    - Nguồn tra cứu: AudD (nếu có AUDD_API_KEY) -> Musixmatch -> lyrics.ovh ->
+      lrclib, plus Genius bổ sung (nhiều bài Việt / ít phổ biến chỉ có trên
+      Genius). Nếu mọi nguồn đều không có -> báo "Không tìm thấy lyrics".
+    - Bị chặn nếu owner đã /disable phát nhạc.
+
+
 ------------------------------------------------------------
 7. LỆNH DÀNH CHO OWNER (người quản lý)
 ------------------------------------------------------------
