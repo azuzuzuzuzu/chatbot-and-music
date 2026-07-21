@@ -52,10 +52,10 @@ OWNER_IDS = [
 ]
 
 # Cấu hình chatbot engine (API tương thích OpenAI-style).
-CHAT_API_URL = "https://anticode.vn/v1/chat/completions"
+CHAT_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Endpoint này không yêu cầu API key.
 CHAT_API_KEY = os.environ.get("CHAT_API_KEY", "")
-CHAT_MODEL = "grok_4.5"
+CHAT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # Cấu hình Spotify (lấy metadata bài/playlist rồi search YouTube để phát).
 # Tạo app tại developer.spotify.com để có Client ID/Secret, đặt qua env.
@@ -2250,14 +2250,8 @@ async def generate_reply(user_text: str, history: List[dict],
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
 
-    # Endpoint này yêu cầu trường "prompt". Ta gộp lịch sử hội thoại thành
-    # một transcript dạng text để giữ ngữ cảnh, kết thúc bằng lượt của bot.
-    prompt = build_prompt(user_text, history, system_prompt)
-
     payload = {
         "model": CHAT_MODEL,
-        "prompt": prompt,
-        # Giữ kèm "messages" làm fallback cho các API hỗ trợ định dạng này.
         "messages": messages,
     }
     headers = {
