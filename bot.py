@@ -40,7 +40,7 @@ except ImportError:  # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 # Token bot - nên đặt qua biến môi trường để bảo mật. Có thể thay trực tiếp.
-TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TOKEN = os.environ.get("DISCORD_TOKEN", "")
 
 # Bot chỉ hoạt động trong server này.
 GUILD_ID = 1327664793544560661  # <-- THAY bằng ID server thật của bạn
@@ -52,10 +52,10 @@ OWNER_IDS = [
 ]
 
 # Cấu hình chatbot engine (API tương thích OpenAI-style).
-CHAT_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+CHAT_API_URL = "https://api.hcnsec.cn/v1/chat/completions"
 # Endpoint này không yêu cầu API key.
 CHAT_API_KEY = os.environ.get("CHAT_API_KEY", "")
-CHAT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+CHAT_MODEL = "Kimi-K2.6"
 
 # Cấu hình Spotify (lấy metadata bài/playlist rồi search YouTube để phát).
 # Tạo app tại developer.spotify.com để có Client ID/Secret, đặt qua env.
@@ -90,7 +90,7 @@ FEATURE_LABELS = {
 
 # Các giới hạn.
 COOLDOWN_SECONDS = 2          # Cooldown mỗi user (khớp với mô tả ở đầu file).
-MAX_HISTORY_TURNS = 40        # Số lượt hội thoại giữ lại (30-50). 1 lượt = user + bot.
+MAX_HISTORY_TURNS = 25        # Số lượt hội thoại giữ lại (30-50). 1 lượt = user + bot.
 MAX_DISCORD_MSG_LEN = 2000    # Giới hạn độ dài 1 tin nhắn Discord.
 MAX_SYSTEM_PROMPT_LEN = 3000  # Giới hạn độ dài system prompt user tự đặt.
 
@@ -116,6 +116,11 @@ YTDL_OPTS = {
     # Bật remote-components để yt-dlp tự tải solver từ GitHub (cần mạng lần đầu).
     # Phải là LIST (không phải string) khi truyền qua Python API, nếu không bị bỏ qua.
     "remote_components": ["ejs:github"],
+    # Client tv phá được signature challenge. Dùng string (Python API
+    # bỏ qua list `['tv','web_safari']` — yt-dlp bug).
+    "extractor_args": {
+        "youtube": {"player_client": "tv"}
+    },
 }
 
 # Tùy chọn file cookie (session Google) để qua lỗi 403 của YouTube browse API
@@ -224,6 +229,9 @@ tree = app_commands.CommandTree(client)
 
 # Cooldown riêng từng user: {user_id: last_reply_timestamp}
 _user_cooldowns: Dict[int, float] = {}
+
+# Global aiohttp session (created in on_ready, closed on shutdown)
+_http_session: Optional[aiohttp.ClientSession] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -726,6 +734,7 @@ class Track:
         self.resolved = stream_url is not None
         self._resolving = False             # Chống resolve trùng (do _ensure_resolved quản lý).
         self.resolve_failed = False         # Đã thử resolve thất bại -> resolver bỏ qua.
+        self.notify_failed = False          # Đã gửi thông báo fail cho user.
 
 
 class GuildPlayer:
@@ -787,6 +796,9 @@ class GuildPlayer:
         if self.voice is None or not self.voice.is_connected():
             self.current = None
             return
+        log.info("[_play_next] guild=%d queue=%d current=%s",
+                 self.guild_id, len(self.queue),
+                 self.current.title if self.current else "none")
         async with self._advance_lock:
             # Đã có bài phát/pause -> không tự động chuyển (tránh chồng lấp).
             if self.voice.is_playing() or self.voice.is_paused():
@@ -798,7 +810,9 @@ class GuildPlayer:
                     if track.resolve_failed:
                         # Đã thử resolve thất bại trước đó (resolver nền) ->
                         # bỏ qua luôn, không tốn thêm 1 lượt yt-dlp.
-                        if self.text_channel is not None:
+                        log.info("[_play_next] skip resolve_failed guild=%d title=%r",
+                                 self.guild_id, track.title)
+                        if not track.notify_failed and self.text_channel is not None:
                             try:
                                 await self.text_channel.send(
                                     f"⚠️ Bỏ qua (không phát được): **{track.title}**",
@@ -809,6 +823,8 @@ class GuildPlayer:
                         continue
                     ok = await _ensure_resolved(track)
                     if not ok:
+                        log.warning("[_play_next] _ensure_resolved failed guild=%d title=%r query=%r",
+                                    self.guild_id, track.title, track.query)
                         if self.text_channel is not None:
                             try:
                                 await self.text_channel.send(
@@ -830,6 +846,9 @@ class GuildPlayer:
                     volume=self.volume,
                 )
                 self.voice.play(source, after=self._after_play)
+                log.info("[_play_next] playing guild=%d title=%r resolved=%d duration=%s",
+                         self.guild_id, track.title, int(track.resolved),
+                         _fmt_duration(track.duration))
                 if self.text_channel is not None:
                     try:
                         await self.text_channel.send(
@@ -847,6 +866,9 @@ class GuildPlayer:
         if self.voice is None or not self.voice.is_connected():
             return
         if not self.voice.is_playing() and not self.voice.is_paused():
+            log.info("[start_if_idle] guild=%d queue=%d playing=%d paused=%d",
+                     self.guild_id, len(self.queue),
+                     int(self.voice.is_playing()), int(self.voice.is_paused()))
             await self._play_next()
 
     def _humans_in_channel(self) -> int:
@@ -917,6 +939,7 @@ class GuildPlayer:
         Giúp /queue hiện title thật và _play_next không phải chờ resolve.
         Thao tác theo THAM CHIẾU Track (không theo index) để an toàn khi
         queue bị pop/remove trong lúc resolve.
+        Gửi thông báo cho user khi track resolve thất bại.
         """
         sem = asyncio.Semaphore(3)
         try:
@@ -925,14 +948,36 @@ class GuildPlayer:
                            if not t.resolved and not t._resolving
                            and not t.resolve_failed and t.query]
                 if not pending:
+                    log.info("[_resolve_ahead] guild=%d no pending tracks, exiting",
+                             self.guild_id)
                     return
+                log.info("[_resolve_ahead] guild=%d resolving %d pending tracks: %s",
+                         self.guild_id, len(pending),
+                         ", ".join(f"{t.title!r}" for t in pending[:5]))
 
                 async def one(tr: Track) -> None:
                     try:
                         async with sem:
-                            await _ensure_resolved(tr)
+                            ok = await _ensure_resolved(tr)
+                        if ok:
+                            log.info("[_resolve_ahead] resolved guild=%d title=%r",
+                                     self.guild_id, tr.title)
+                        elif not tr.notify_failed:
+                            # Gửi thông báo fail cho user (nếu có text channel).
+                            if self.text_channel is not None:
+                                try:
+                                    await self.text_channel.send(
+                                        f"⚠️ Không phát được: **{tr.title}**",
+                                        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                                    )
+                                except discord.HTTPException:
+                                    pass
+                            log.info("[_resolve_ahead] failed guild=%d title=%r",
+                                     self.guild_id, tr.title)
+                            tr.notify_failed = True
                     except Exception:  # noqa: BLE001
-                        log.error("Lỗi resolve nền track %r", tr.query)
+                        log.error("[_resolve_ahead] exception guild=%d query=%r",
+                                  self.guild_id, tr.query)
 
                 await asyncio.gather(*(one(t) for t in pending[:10]))
         except asyncio.CancelledError:
@@ -1099,6 +1144,8 @@ async def _ensure_resolved(track: Track) -> bool:
         # Hết thời gian chờ vẫn chưa xong -> tự resolve bên dưới.
     track._resolving = True
     try:
+        log.info("[_ensure_resolved] starting requester=%s title=%r query=%r",
+                 track.requester, track.title, track.query[:60])
         resolved = await resolve_track(track.query, track.requester)
     finally:
         track._resolving = False
@@ -1106,6 +1153,8 @@ async def _ensure_resolved(track: Track) -> bool:
     if track.resolved and track.stream_url:
         return True
     if resolved is None or not resolved.stream_url:
+        log.warning("[_ensure_resolved] failed title=%r query=%r",
+                    track.title, track.query[:60])
         track.resolve_failed = True
         return False
     track.stream_url = resolved.stream_url
@@ -1562,7 +1611,7 @@ async def _add_full_youtube_playlist(player: "GuildPlayer", url: str,
     # Playlist listing dùng browse API hay bị YouTube chặn 403 với client web
     # mặc định. Dùng client tv / web_safari để lấy được danh sách bài.
     opts["extractor_args"] = {
-        "youtube": {"player_client": ["tv", "web_safari", "web"]}
+        "youtube": {"player_client": "tv"}
     }
 
     # watch?v=...&list=PL... -> playlist?list=PL... (yt-dlp extract_flat chỉ
@@ -1798,12 +1847,11 @@ async def music_play(
     if _is_spotify_url(query):
         return await _play_spotify(player, query, member.display_name)
 
-    track = await resolve_track(query, requester=member.display_name)
-    if track is None:
-        return ("❌ Không lấy được nhạc từ link/từ khóa này. "
-                "Kiểm tra lại link, hoặc đảm bảo yt-dlp + ffmpeg đã cài.")
-
-    # Áp dụng metadata nguồn gốc (Spotify) nếu có.
+    # Lazy resolve: tạo Track ngay, resolve nền dần. Trả về prompt cho user
+    # không phải chờ yt-dlp. Title tạm = query, `_resolve_ahead` cập nhật
+    # title thật khi resolve xong.
+    track = Track(title=query, requester=member.display_name, query=query)
+    # Áp dụng metadata nguồn gốc (Spotify) nếu có — giữ cho songinfo hiển thị đúng.
     if meta:
         if meta.get("source"):
             track.source = meta["source"]
@@ -1815,8 +1863,10 @@ async def music_play(
             track.release = meta["release"]
         if meta.get("popularity") is not None:
             track.popularity = meta["popularity"]
-
+        log.info("[music_play] meta applied: source=%s album=%s", track.source, track.album)
     player.add(track)
+    player.start_resolver()
+    log.info("[music_play] lazy add guild=%d queue=%d query=%r", guild.id, len(player.queue), query)
 
     # Nếu đang rảnh thì phát luôn; ngược lại báo đã thêm vào queue.
     # Khi phát ngay bài đầu: trả về "" (sentinel) — _play_next đã tự gửi tin
@@ -1824,7 +1874,7 @@ async def music_play(
     if not player.voice.is_playing() and not player.voice.is_paused():
         await player.start_if_idle()
         return ""
-    return f"➕ Đã thêm vào hàng đợi (#{len(player.queue)}): **{track.title}**"
+    return f"➕ Đã thêm vào hàng đợi (#{len(player.queue)}): **{query}**"
 
 
 async def _play_spotify(player: "GuildPlayer", url: str,
@@ -4421,7 +4471,11 @@ def ensure_opus_loaded() -> bool:
 @client.event
 async def on_ready():
     """Đồng bộ slash command với guild khi bot khởi động."""
+    global _http_session
     ensure_memory_dir()
+    # Connection pool: limit 100 concurrent connections, 30s keepalive
+    connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+    _http_session = aiohttp.ClientSession(connector=connector)
     try:
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
@@ -6192,7 +6246,7 @@ async def on_message(message: discord.Message):
     if not user_text:
         # Mention bot nhưng không có nội dung.
         await send_long_message(
-            message.channel, "Bạn cần gì nè? 😄", reference=message
+            message.channel, "Bạn cần gì nà?", reference=message
         )
         update_cooldown(user_id)
         return
